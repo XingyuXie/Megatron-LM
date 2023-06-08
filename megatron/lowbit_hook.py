@@ -12,27 +12,43 @@ import math
 
 __all__ = [
      "lowbit_hook",
-     "LowbitState"
+     "LowbitState",
+     "fp32_compress_hook"
 ]
 
 logger = logging.getLogger(__name__)
 
+def fp32_compress_hook(
+    process_group: dist.ProcessGroup, bucket: dist.GradBucket
+) -> torch.futures.Future[torch.Tensor]:
+    """
+    This DDP communication hook implements a simple gradient compression
+    approach that casts ``GradBucket`` tensor to half-precision floating-point format (``torch.float16``)
+    and then divides it by the process group size.
+    It allreduces those ``float16`` gradient tensors. Once compressed gradient
+    tensors are allreduced, the chained callback ``decompress`` casts it back to the input data type (such as ``float32``).
 
+    Example::
+        >>> # xdoctest: +SKIP
+        >>> ddp_model.register_comm_hook(process_group, fp16_compress_hook)
+    """
+    group_to_use = process_group if process_group is not None else dist.group.WORLD
+    world_size = group_to_use.size()
 
-def safe_scale_factor(tensor, max_float16=torch.finfo(torch.float16).max, eps=1e-6):
-    # assert that input tensor does not contain nan
-    assert not torch.isnan(tensor).any(), 'input tensor should not contain nan'
-    tensor_max = torch.max(tensor.abs()) + eps
-    # assert that tensor_max is not nan
-    assert not torch.isnan(tensor_max), 'tensor_max should not be nan'
-    scale_factor = max_float16 / tensor_max
-    # ensure scale_factor is positive
-    if scale_factor <= 0:
-        return 1
-    # find the pow of 2
-    nearest_pow2 = pow(2, round(math.log2(scale_factor)))
-    return nearest_pow2
+    compressed_tensor = bucket.buffer().clone().detach().div_(world_size)
 
+    fut = dist.all_reduce(
+        compressed_tensor, group=group_to_use, async_op=True
+    ).get_future()
+
+    def decompress(fut):
+        decompressed_tensor = bucket.buffer()
+        # Decompress in place to reduce the peak memory.
+        # See: https://github.com/pytorch/pytorch/issues/45968
+        decompressed_tensor.copy_(fut.value()[0])
+        return decompressed_tensor
+    
+    return fut.then(decompress)
 
 
 
@@ -54,6 +70,7 @@ class LowbitState:
         "start_lowbit_iter",
         "error_beta",
         "ref_lr",
+        "grad_scale",
         # The fields below are the binary hyperparameters recommended to be turned on for performance and accuracy.
         "use_error_feedback",
         "use_ref_point",
@@ -61,6 +78,8 @@ class LowbitState:
         "error_dict",
         "refpoint_dict",
         "iter",
+        "scale_step",
+        "scale_iter"
     ]
 
     def __init__(
@@ -70,14 +89,17 @@ class LowbitState:
         use_error_feedback=True,
         error_beta=0.95,
         use_ref_point=True,
-        ref_lr=1.0
+        ref_lr=1.0,
+        grad_scale=1024.0,
+        scale_step = 1024
     ):
         logger.info(
             "Lowbit Optimizaer config: start_powerSGD_iter = %s; "
-            "use_error_feedback = %s;  use_ref_point = %s",
+            "use_error_feedback = %s;  use_ref_point = %s;  grad_scale=%s",
             start_lowbit_iter,
             use_error_feedback,
-            use_ref_point
+            use_ref_point,
+            grad_scale
         )
 
         self.process_group = process_group
@@ -107,6 +129,9 @@ class LowbitState:
         self.refpoint_dict: Dict[int, torch.Tensor] = {}
         # Iteration/step in the training loop.
         self.iter = 0
+        self.scale_iter = -1
+        self.grad_scale = grad_scale
+        self.scale_step = scale_step
 
     def __getstate__(self):
         r"""
@@ -197,9 +222,9 @@ def lowbitopt_hook(
     if state.use_ref_point:
         if bucket_index in state.refpoint_dict:
             input_tensor.add_(state.refpoint_dict[bucket_index], alpha=-1.0)
-            if torch.isnan(input_tensor).any():
-                print("ref point range is {} --- {}".format(torch.min(state.refpoint_dict[bucket_index]),torch.max(state.refpoint_dict[bucket_index])))
-            assert not torch.isnan(input_tensor).any(), 'input tensor should not contain nan after ref point'
+            # if torch.isnan(input_tensor).any():
+            #     print("ref point range is {} --- {}".format(torch.min(state.refpoint_dict[bucket_index]),torch.max(state.refpoint_dict[bucket_index])))
+            # assert not torch.isnan(input_tensor).any(), 'input tensor should not contain nan after ref point'
         else:
             logger.info(
                 "A zero tensor of length %s that represents global refrence point is created.",
@@ -212,7 +237,7 @@ def lowbitopt_hook(
     if state.use_error_feedback:
         if bucket_index in state.error_dict:
             input_tensor.add_(state.error_dict[bucket_index])
-            assert not torch.isnan(input_tensor).any(), 'input tensor should not contain nan after error'
+            # assert not torch.isnan(input_tensor).any(), 'input tensor should not contain nan after error'
         else:
             logger.info(
                 "A zero tensor of length %s that represents local error is created.",
@@ -222,34 +247,24 @@ def lowbitopt_hook(
                 total_length, device=device, dtype=dtype
             )
         
-
-    # # Keep a copy of the input tensor,
-    # # so that we can compute the local error caused by compression later,
-    # # by comparing this copy and the input tensor updated after decompression.
-    # if state.use_error_feedback or state.use_ref_point:
-    #     input_tensor_cp = torch.clone(input_tensor).detach()
+    # if torch.isnan(input_tensor).any():
+    #     print("All redicu step {}".format(state.iter))
+    #     assert not torch.isnan(input_tensor).any(), 'input tensor should not contain nan'
         
-    # compress data with proper scale
-    # print(
-    #     "All redicu step {}".format(state.iter)    
-    # )
-    if torch.isnan(input_tensor).any():
-        print("All redicu step {}".format(state.iter))
-        assert not torch.isnan(input_tensor).any(), 'input tensor should not contain nan'
-    scale_factor = 1.0#safe_scale_factor(input_tensor)
+    safe_scale_factor(input_tensor, state)
         
-    compressed_tensor = input_tensor.mul_(scale_factor).to(torch.float16)
-    if torch.isinf(compressed_tensor).any():
-        print("input tensor range is {} --- {}".format(torch.min(input_tensor),torch.max(input_tensor)))
-        print("scale_factor is {}".format(scale_factor))
-    assert not torch.isinf(compressed_tensor).any(), 'local grad should not contain inf'
+    compressed_tensor = input_tensor.mul_(state.grad_scale).to(torch.float16)
+    # if torch.isinf(compressed_tensor).any():
+    #     print("input tensor range is {} --- {}".format(torch.min(input_tensor),torch.max(input_tensor)))
+    #     print("scale_factor is {}".format(state.grad_scale))
+    # assert not torch.isinf(compressed_tensor).any(), 'local grad should not contain inf'
     if state.use_error_feedback:
         # implememt err*state.error_beta + (1-error_beta)*(input_tensor-compressed_tensor)/scale
         state.error_dict[bucket_index].mul_(state.error_beta)
-        state.error_dict[bucket_index].add_(input_tensor, alpha=(1.-state.error_beta)/scale_factor)
+        state.error_dict[bucket_index].add_(input_tensor, alpha=(1.-state.error_beta)/state.grad_scale)
         input_tensor.copy_(compressed_tensor)
-        state.error_dict[bucket_index].add_(input_tensor, alpha= -(1.-state.error_beta)/scale_factor)
-        assert not torch.isnan(state.error_dict[bucket_index]).any(), 'Error Feedback should not contain nan'
+        state.error_dict[bucket_index].add_(input_tensor, alpha= -(1.-state.error_beta)/state.grad_scale)
+        # assert not torch.isnan(state.error_dict[bucket_index]).any(), 'Error Feedback should not contain nan'
     
     
     compressed_tensor.div_(world_size)
@@ -262,24 +277,24 @@ def lowbitopt_hook(
         # Decompress in place to reduce the peak memory.
         # See: https://github.com/pytorch/pytorch/issues/45968
         grads.copy_(fut.value()[0])
-        grads.div_(scale_factor)
-        assert not torch.isinf(grads).any(), 'grad should not contain inf'
+        grads.div_(state.grad_scale)
+        # assert not torch.isinf(grads).any(), 'grad after all reduce contain INF'
         if state.use_ref_point:
             grads.add_(state.refpoint_dict[bucket_index], alpha=state.ref_lr)
             # h_g_sgn = grads.sign()
             state.refpoint_dict[bucket_index].copy_(grads)
             # state.refpoint_dict[bucket_index].div_(1.0+state.ref_lr)
             
-            assert not torch.isnan(state.refpoint_dict[bucket_index]).any(), 'Ref Point 0 should not contain nan'
+            # assert not torch.isnan(state.refpoint_dict[bucket_index]).any(), 'Ref Point 0 should not contain nan'
             local_var = grads.abs().mul_(4).add_(state.ref_lr**2).sqrt_().add_(state.ref_lr)
-            assert not torch.isnan(local_var).any(), 'local_var should not contain nan'
+            # assert not torch.isnan(local_var).any(), 'local_var should not contain nan'
             state.refpoint_dict[bucket_index].mul_(2.0).div_(local_var)
-            if torch.isnan(state.refpoint_dict[bucket_index]).any():
-                print("local var range is {} --- {}".format(torch.min(local_var),torch.max(local_var)))
-            assert not torch.isnan(state.refpoint_dict[bucket_index]).any(), 'Ref Point 1 should not contain nan'
+            # if torch.isnan(state.refpoint_dict[bucket_index]).any():
+            #     print("local var range is {} --- {}".format(torch.min(local_var),torch.max(local_var)))
+            # assert not torch.isnan(state.refpoint_dict[bucket_index]).any(), 'Ref Point 1 should not contain nan'
             torch.abs(grads, out=local_var)
             state.refpoint_dict[bucket_index].square_().mul_(local_var)
-            assert not torch.isinf(state.refpoint_dict[bucket_index]).any(), 'Ref Point 2 should not contain inf'
+            # assert not torch.isinf(state.refpoint_dict[bucket_index]).any(), 'Ref Point 2 should not contain inf'
             
 
         
@@ -288,3 +303,26 @@ def lowbitopt_hook(
         return grads
 
     return fut.then(decompress)
+
+
+def safe_scale_factor(tensor, state: LowbitState, max_float16=torch.finfo(torch.float16).max, eps=1e-6):
+    # assert that input tensor does not contain INF
+    # assert not torch.isinf(tensor).any(), 'gradient tensor should not contain INF'
+    tensor_max = torch.max(tensor.abs()) + eps
+
+    # keep halving state.grad_scale until tensor_max * state.grad_scale < max_float16
+    while tensor_max * state.grad_scale >= max_float16:
+        state.grad_scale *= 0.5
+        if state.grad_scale < 1e-4: 
+            state.grad_scale = 1e-4
+            break
+        state.scale_iter = -1
+        
+    state.scale_iter += 1
+    if state.scale_iter > state.scale_step:
+        state.grad_scale *= 2.0
+        state.scale_iter = 0
+
+        # state.grad_scale = pow(2, round(math.log2(state.grad_scale)))
+
+

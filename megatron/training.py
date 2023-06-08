@@ -40,8 +40,8 @@ from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
-from megatron.lowbit_hook import LowbitState, lowbitopt_hook
-
+from megatron.lowbit_hook import LowbitState, lowbitopt_hook, fp32_compress_hook
+from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compress_hook
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -295,14 +295,18 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             for model_module in model:
                 DDP_module =torchDDP(model_module, device_ids=[i], output_device=i,
                               process_group=mpu.get_data_parallel_group())
-                
-                lowbit_state = LowbitState(process_group=None,error_beta=args.adam_beta2)
-                DDP_module.register_comm_hook(lowbit_state, lowbitopt_hook)
+                if args.low_bit_optimizer=='ourfp16':
+                    lowbit_state = LowbitState(process_group=None,error_beta=args.adam_beta2)
+                    DDP_module.register_comm_hook(lowbit_state, lowbitopt_hook)
+                elif args.low_bit_optimizer=='fp16':
+                    DDP_module.register_comm_hook(state=None, hook=fp16_compress_hook)
+                elif args.low_bit_optimizer=='fp32':
+                    DDP_module.register_comm_hook(state=None, hook=fp32_compress_hook)
                 torchDDP_model.append(DDP_module)
             # model = [torchDDP(model_module, device_ids=[i], output_device=i,
             #                   process_group=mpu.get_data_parallel_group())
             #          for model_module in model]
-            print_rank_0("Add Lowbit hooker for torchDDP models")
+            # print_rank_0("Add Lowbit hooker for torchDDP models")
             model = torchDDP_model
         elif args.DDP_impl == 'local':
             model = [LocalDDP(model_module,
