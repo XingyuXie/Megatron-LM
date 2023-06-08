@@ -2,6 +2,8 @@
 
 from apex.optimizers import FusedAdam as Adam
 from apex.optimizers import FusedSGD as SGD
+from .adamw import AdamW
+from .lowbithook import LowbitHook
 
 from megatron import get_args
 
@@ -78,6 +80,24 @@ def get_megatron_optimizer(model,
                          weight_decay=args.weight_decay,
                          betas=(args.adam_beta1, args.adam_beta2),
                          eps=args.adam_eps)
+    elif args.optimizer == 'adamw':
+        optimizer = AdamW(param_groups,
+                         lr=args.lr,
+                         weight_decay=args.weight_decay,
+                         betas=(args.adam_beta1, args.adam_beta2),
+                         eps=args.adam_eps)
+        # if not args.low_bit_optimizer:
+        #     optimizer = AdamW(param_groups,
+        #                     lr=args.lr,
+        #                     weight_decay=args.weight_decay,
+        #                     betas=(args.adam_beta1, args.adam_beta2),
+        #                     eps=args.adam_eps)
+        # else: LowbitHook(param_groups,
+        #                  base_optimizer=AdamW,
+        #                  lr=args.lr,
+        #                  weight_decay=args.weight_decay,
+        #                  betas=(args.adam_beta1, args.adam_beta2),
+        #                  eps=args.adam_eps)
     elif args.optimizer == 'sgd':
         optimizer = SGD(param_groups,
                         lr=args.lr,

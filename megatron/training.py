@@ -40,6 +40,7 @@ from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
+from megatron.lowbit_hook import LowbitState, lowbitopt_hook
 
 
 def print_datetime(string):
@@ -202,7 +203,6 @@ def update_train_iters(args):
 
     print_rank_0('setting training iterations to {}'.format(args.train_iters))
 
-
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True):
     """Build the model."""
     args = get_args()
@@ -291,10 +291,19 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if wrap_with_ddp:
         if args.DDP_impl == 'torch':
             i = torch.cuda.current_device()
-            model = [torchDDP(model_module, device_ids=[i], output_device=i,
+            torchDDP_model = []
+            for model_module in model:
+                DDP_module =torchDDP(model_module, device_ids=[i], output_device=i,
                               process_group=mpu.get_data_parallel_group())
-                     for model_module in model]
-
+                
+                lowbit_state = LowbitState(process_group=None,error_beta=args.adam_beta2)
+                DDP_module.register_comm_hook(lowbit_state, lowbitopt_hook)
+                torchDDP_model.append(DDP_module)
+            # model = [torchDDP(model_module, device_ids=[i], output_device=i,
+            #                   process_group=mpu.get_data_parallel_group())
+            #          for model_module in model]
+            print_rank_0("Add Lowbit hooker for torchDDP models")
+            model = torchDDP_model
         elif args.DDP_impl == 'local':
             model = [LocalDDP(model_module,
                               args.accumulate_allreduce_grads_in_fp32,
