@@ -90,7 +90,7 @@ class LowbitState:
         error_beta=0.95,
         use_ref_point=True,
         ref_lr=1.0,
-        grad_scale= 128.0,
+        grad_scale= 1.0,
         scale_step = 2048
     ):
         logger.info(
@@ -218,8 +218,7 @@ def lowbitopt_hook(
     # Incorporate the error from the previous state into the gradients.
     bucket_index = bucket.index()
     total_length = input_tensor.shape[0]
-    if state.use_ref_point or state.use_error_feedback:
-        local_var = torch.empty_like(input_tensor, dtype=dtype)
+    
     
     if state.use_ref_point:
         if bucket_index in state.refpoint_dict:
@@ -248,20 +247,18 @@ def lowbitopt_hook(
             state.error_dict[bucket_index] = torch.zeros(
                 total_length, device=device, dtype=dtype
             )
+    if state.use_ref_point or state.use_error_feedback:
+        local_var = input_tensor.abs()
         
-    # if torch.isnan(input_tensor).any():
-    #     print("All redicu step {}".format(state.iter))
-    #     assert not torch.isnan(input_tensor).any(), 'input tensor should not contain nan'
+    # safe_scale_factor(local_var, state)
         
-    safe_scale_factor(input_tensor.div_(world_size), state)
-        
-    compressed_tensor = input_tensor.mul_(state.grad_scale).to(torch.float16)
+    compressed_tensor = input_tensor.mul_(state.grad_scale/world_size).to(torch.float16)
     # if torch.isinf(compressed_tensor).any():
     #     print("input tensor range is {} --- {}".format(torch.min(input_tensor),torch.max(input_tensor)))
     #     print("scale_factor is {}".format(state.grad_scale))
     # assert not torch.isinf(compressed_tensor).any(), 'local grad should not contain inf'
     if state.use_error_feedback:
-        local_var = compressed_tensor.to(dtype)
+        local_var.copy_(compressed_tensor)
         input_tensor.add(local_var,alpha=-1.0).mul_(world_size/state.grad_scale)
         state.error_dict[bucket_index].lerp_(input_tensor, 1.-state.error_beta)
         # implememt err*state.error_beta + (1-error_beta)*(input_tensor-compressed_tensor)/scale
@@ -319,8 +316,8 @@ def safe_scale_factor(tensor, state: LowbitState, max_float16=torch.finfo(torch.
     # keep halving state.grad_scale until tensor_max * state.grad_scale < max_float16
     while tensor_max * state.grad_scale >= max_float16:
         state.grad_scale *= 0.5
-        if state.grad_scale < 1: 
-            state.grad_scale = 1
+        if state.grad_scale < 1e-5: 
+            state.grad_scale = 1e-5
             break
         state.scale_iter = -1
         
