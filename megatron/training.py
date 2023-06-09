@@ -41,7 +41,7 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 from megatron.lowbit_hook import LowbitState, lowbitopt_hook, fp32_compress_hook
-from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compress_hook
+from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compress_hook, allreduce_hook
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -302,6 +302,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                     DDP_module.register_comm_hook(state=None, hook=fp16_compress_hook)
                 elif args.low_bit_optimizer=='fp32':
                     DDP_module.register_comm_hook(state=None, hook=fp32_compress_hook)
+                elif args.low_bit_optimizer=='ori':
+                    DDP_module.register_comm_hook(state=None, hook=allreduce_hook)
                 torchDDP_model.append(DDP_module)
             # model = [torchDDP(model_module, device_ids=[i], output_device=i,
             #                   process_group=mpu.get_data_parallel_group())
