@@ -50,19 +50,7 @@ def fp32_compress_hook(
     
     return fut.then(decompress)
 
-
-
 class LowbitState:
-    r"""
-    Stores both the algorithm's hyperparameters and the internal state for all the gradients during the training.
-
-    2. ``start_lowbit_iter`` defers compression until step ``start_low_iter``, and vanilla allreduce runs prior to step ``start_lowbit_iter``. 
-
-    .. warning ::
-        If error feedback or warm-up is enabled, the minimum value of ``start_lowbit_iter`` allowed in DDP is 2.
-        This is because there is another internal optimization that rebuilds buckets at iteration 1 in DDP,
-        and this can conflict with any tensor memorized before the rebuild process.
-    """  # noqa: B950
 
     __slots__ = [
         "process_group",
@@ -90,7 +78,7 @@ class LowbitState:
         error_beta=0.95,
         use_ref_point=True,
         ref_lr=1.0,
-        grad_scale= 1.0,
+        grad_scale= 32.0,
         scale_step = 2048
     ):
         logger.info(
@@ -134,7 +122,7 @@ class LowbitState:
         self.scale_step = scale_step
 
     def __getstate__(self):
-        r"""
+        """
         Returns a ``Dict[str, Any]`` which will be pickled and saved.
         ``process_group`` is not serializable and excluded from
         a returned state.
@@ -165,6 +153,7 @@ class LowbitState:
         # Only increase `iter` when bucket 0 is processed.
         if bucket.is_last():
             self.iter += 1
+            self.scale_iter+=1
 
         if self.iter == self.start_lowbit_iter:
             logger.info(
@@ -177,7 +166,7 @@ class LowbitState:
 def lowbitopt_hook(
     state: LowbitState, bucket: dist.GradBucket
 ) -> torch.futures.Future[torch.Tensor]:
-    r"""
+    """
     This DDP communication hook.
 
     Note that this communication hook enforces vanilla allreduce for the first ``state.start_powerSGD_iter`` iterations.
@@ -250,9 +239,9 @@ def lowbitopt_hook(
     if state.use_ref_point or state.use_error_feedback:
         local_var = input_tensor.abs()
         
-    # safe_scale_factor(local_var, state)
+    # 
         
-    compressed_tensor = input_tensor.mul_(state.grad_scale/world_size).to(torch.float16)
+    compressed_tensor = input_tensor.mul_(state.grad_scale/world_size).to(torch.int8)
     # if torch.isinf(compressed_tensor).any():
     #     print("input tensor range is {} --- {}".format(torch.min(input_tensor),torch.max(input_tensor)))
     #     print("scale_factor is {}".format(state.grad_scale))
@@ -302,6 +291,7 @@ def lowbitopt_hook(
 
         
         state.maybe_increase_iter(bucket)
+        safe_scale_factor(local_var, state)
         # print("Finsh our step {}".format(state.iter)    )
         return grads
 
@@ -316,8 +306,8 @@ def safe_scale_factor(tensor, state: LowbitState, max_float16=torch.finfo(torch.
     # keep halving state.grad_scale until tensor_max * state.grad_scale < max_float16
     while tensor_max * state.grad_scale >= max_float16:
         state.grad_scale *= 0.5
-        if state.grad_scale < 1e-5: 
-            state.grad_scale = 1e-5
+        if state.grad_scale < 1.0: 
+            state.grad_scale = 1.0
             break
         state.scale_iter = -1
         
@@ -327,5 +317,5 @@ def safe_scale_factor(tensor, state: LowbitState, max_float16=torch.finfo(torch.
         state.scale_iter = 0
 
         # state.grad_scale = pow(2, round(math.log2(state.grad_scale)))
-
+        
 

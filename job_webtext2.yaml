@@ -1,0 +1,155 @@
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: "xyxie-5w-llm-9"
+  labels:
+    estimated-running-time: "48h"
+spec:
+
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+          labels:
+            estimated-running-time: "48h"
+        spec:
+          containers:
+          - name: pytorch
+            image: asia-docker.pkg.dev/sail-tpu-02/git-insea-io/common/image_registry/xyxie/py3817cu11:ds
+            imagePullPolicy: Always
+            command:
+            - /bin/bash
+            - -x 
+            - -c
+            args: ["cd /code/Megatron-LM/; \
+                  export MASTER_ADDR=$(hostname); \
+                  export NUM=LM-9;
+                  export CUDA_DEVICE_MAX_CONNECTIONS=1; \
+                  chmod a+x ./gpt2-$NUM.sh; \
+                  ./gpt2-$NUM.sh;
+                  "]
+            resources:
+              limits:
+                cpu: "64"
+                memory: 256Gi
+                nvidia.com/gpu: 8
+                rdma/hca_shared_devices: 8
+              requests:
+                cpu: "64"
+                memory: 256Gi
+                nvidia.com/gpu: 8
+                rdma/hca_shared_devices: 8
+            securityContext:
+              capabilities:
+                add:
+                - IPC_LOCK
+            volumeMounts:
+              # name need to match volume name below
+            - name: ssd
+              # the mount path is the path in the container
+              mountPath: /dataset
+              readOnly: true
+            - mountPath: /code
+              name: vol
+            - mountPath: /dev/shm
+              name: dshm
+          # terminationGracePeriodSeconds: 0
+          # hostNetwork: true
+          # dnsPolicy: ClusterFirstWithHostNet
+          imagePullSecrets:
+          - name: regcred
+          priorityClassName: high
+          nodeSelector:
+            machine-groups: aiops-ib #DGXA100-920-23687-2530-000 #aiops-ib
+          restartPolicy: Never
+          volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+            - name: vol
+              hostPath:
+                path: /mnt/home/xyxie/
+                type: Directory
+            - name: ssd
+              hostPath:
+                path: /raid/
+                type: Directory
+    Worker:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+          labels:
+            estimated-running-time: "48h"
+        spec:
+          containers:
+          - name: pytorch
+            image: asia-docker.pkg.dev/sail-tpu-02/git-insea-io/common/image_registry/xyxie/py3817cu11:ds
+            imagePullPolicy: Always
+            command:
+            - /bin/bash
+            - -x
+            - -c
+            args: ["
+                  cd /code/Megatron-LM/; \
+                  export NUM=LM-9; \
+                  export CUDA_DEVICE_MAX_CONNECTIONS=1; \
+                  chmod a+x ./gpt2-$NUM.sh; \
+                  ./gpt2-$NUM.sh;
+                  "]
+            resources:
+              limits:
+                cpu: "64"
+                memory: 256Gi
+                nvidia.com/gpu: 8
+                rdma/hca_shared_devices: 8
+              requests:
+                cpu: "64"
+                memory: 256Gi
+                nvidia.com/gpu: 8
+                rdma/hca_shared_devices: 8
+            securityContext:
+              capabilities:
+                add:
+                - IPC_LOCK
+            volumeMounts:
+              # name need to match volume name below
+            - name: ssd
+              # the mount path is the path in the container
+              mountPath: /dataset
+              readOnly: true
+            - mountPath: /code
+              name: vol
+            - mountPath: /dev/shm
+              name: dshm
+          # terminationGracePeriodSeconds: 0
+          # hostNetwork: true
+          # dnsPolicy: ClusterFirstWithHostNet
+          imagePullSecrets:
+          - name: regcred
+          priorityClassName: high
+          nodeSelector:
+            machine-groups: aiops-ib #DGXA100-920-23687-2530-000 #aiops-ib
+          restartPolicy: Never
+          volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+            - name: vol
+              hostPath:
+                path: /mnt/home/xyxie/
+                type: Directory
+            - name: ssd
+              hostPath:
+                path: /raid/
+                type: Directory
+ 
+  runPolicy:
+    schedulingPolicy:
+      priorityClass: high

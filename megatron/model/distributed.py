@@ -90,13 +90,17 @@ class DistributedDataParallel(DistributedDataParallelBase):
 
     def __init__(self, module,
                  accumulate_allreduce_grads_in_fp32,
-                 use_contiguous_buffers):
+                 use_contiguous_buffers,
+                 grad_compression=False):
 
         super(DistributedDataParallel, self).__init__(module)
 
         self.accumulate_allreduce_grads_in_fp32 \
             = accumulate_allreduce_grads_in_fp32
         self.use_contiguous_buffers = use_contiguous_buffers
+        self.grad_compression=grad_compression
+        if self.grad_compression:
+            print("We will compresse grad to int8!!!")
         # If we are using fp32-accumulate-allreduce explicitly
         # this means we need main grads in a continous buffer.
         if self.accumulate_allreduce_grads_in_fp32:
@@ -204,9 +208,16 @@ class DistributedDataParallel(DistributedDataParallelBase):
         # If we have buffers, simply reduce the data in the buffer.
         if self._grad_buffers is not None:
             for _, buffer_ in self._grad_buffers.items():
-                buffer_.data /= mpu.get_data_parallel_world_size()
-                torch.distributed.all_reduce(
-                    buffer_.data, group=mpu.get_data_parallel_group())
+                if self.grad_compression:
+                    buffer_.data.div_(mpu.get_data_parallel_world_size()/1024.0)
+                    tmp = buffer_.data.to(torch.int8)
+                    torch.distributed.all_reduce(
+                        tmp, group=mpu.get_data_parallel_group())
+                    buffer_.data.copy_(tmp).div_(1024.0)
+                else:
+                    buffer_.data /= mpu.get_data_parallel_world_size()
+                    torch.distributed.all_reduce(
+                        buffer_.data, group=mpu.get_data_parallel_group())
         else:
             # Otherwise, bucketize and all-reduce
             buckets = {}
@@ -224,9 +235,17 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 bucket = buckets[tp]
                 grads = [param.grad.data for param in bucket]
                 coalesced = _flatten_dense_tensors(grads)
-                coalesced /= mpu.get_data_parallel_world_size()
-                torch.distributed.all_reduce(
-                    coalesced, group=mpu.get_data_parallel_group())
+                if self.grad_compression:
+                    coalesced.div_(mpu.get_data_parallel_world_size()/1024.0)
+                    tmp = coalesced.to(torch.int8)
+                    torch.distributed.all_reduce(
+                        tmp, group=mpu.get_data_parallel_group())
+                    coalesced=tmp
+                else:
+                    coalesced /= mpu.get_data_parallel_world_size()
+                    torch.distributed.all_reduce(
+                        coalesced, group=mpu.get_data_parallel_group())
                 for buf, synced in zip(grads, _unflatten_dense_tensors(
                         coalesced, grads)):
                     buf.copy_(synced)
+                    if self.grad_compression: buf.div_(1024.0)

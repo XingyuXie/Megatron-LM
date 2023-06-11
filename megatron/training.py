@@ -293,17 +293,18 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             i = torch.cuda.current_device()
             torchDDP_model = []
             for model_module in model:
+                bucket_cap_mb = 25 if args.low_bit_optimizer!='ourfp16' else 50
                 DDP_module =torchDDP(model_module, device_ids=[i], output_device=i,
-                              process_group=mpu.get_data_parallel_group())
+                              process_group=mpu.get_data_parallel_group(), bucket_cap_mb=bucket_cap_mb)
                 if args.low_bit_optimizer=='ourfp16':
-                    lowbit_state = LowbitState(process_group=None,error_beta=args.adam_beta2)
+                    lowbit_state = LowbitState(process_group=mpu.get_data_parallel_group(),error_beta=args.adam_beta2)
                     DDP_module.register_comm_hook(lowbit_state, lowbitopt_hook)
                 elif args.low_bit_optimizer=='fp16':
-                    DDP_module.register_comm_hook(state=None, hook=fp16_compress_hook)
+                    DDP_module.register_comm_hook(state=mpu.get_data_parallel_group(), hook=fp16_compress_hook)
                 elif args.low_bit_optimizer=='fp32':
-                    DDP_module.register_comm_hook(state=None, hook=fp32_compress_hook)
+                    DDP_module.register_comm_hook(state=mpu.get_data_parallel_group(), hook=fp32_compress_hook)
                 elif args.low_bit_optimizer=='ori':
-                    DDP_module.register_comm_hook(state=None, hook=allreduce_hook)
+                    DDP_module.register_comm_hook(state=mpu.get_data_parallel_group(), hook=allreduce_hook)
                 torchDDP_model.append(DDP_module)
             # model = [torchDDP(model_module, device_ids=[i], output_device=i,
             #                   process_group=mpu.get_data_parallel_group())
@@ -313,7 +314,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         elif args.DDP_impl == 'local':
             model = [LocalDDP(model_module,
                               args.accumulate_allreduce_grads_in_fp32,
-                              args.use_contiguous_buffers_in_local_ddp)
+                              args.use_contiguous_buffers_in_local_ddp,
+                              grad_compression=(args.low_bit_optimizer=='ourfp16'))
                      for model_module in model]
             # broad cast params from data parallel src rank to other data parallel ranks
             if args.data_parallel_random_init:
