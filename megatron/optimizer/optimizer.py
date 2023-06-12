@@ -225,7 +225,12 @@ class MegatronOptimizer(ABC):
                     grad = word_embeddings_weight.main_grad
                 else:
                     grad = word_embeddings_weight.grad
-                torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
+                if (args.low_bit_optimizer=='ourint8'):
+                    local_var = grad.mul_(1024.0).to(torch.int8)
+                    torch.distributed.all_reduce(local_var, group=mpu.get_embedding_group())
+                    grad.copy_(local_var).div_(1024.0)
+                else:
+                    torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
 
 
     def allreduce_position_embedding_grads(self, args):
@@ -244,7 +249,13 @@ class MegatronOptimizer(ABC):
             assert args.DDP_impl == 'local', \
                 'T5 model is only supported with local DDP mode'
             grad = unwrapped_model.language_model.embedding.position_embeddings.weight.main_grad
-            torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
+            if (args.low_bit_optimizer=='ourint8'):
+                local_var = grad.mul_(1024.0).to(torch.int8)
+                torch.distributed.all_reduce(local_var, group=mpu.get_position_embedding_group())
+                grad.copy_(local_var).div_(1024.0)
+            else:
+                torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
+            
 
 
     def allreduce_embedding_grads(self, args):
@@ -268,12 +279,16 @@ class MegatronOptimizer(ABC):
                     if getattr(param, 'sequence_parallel', False):
                         grad = param.main_grad if args.DDP_impl == 'local' else param.grad
                         grads.append(grad.data)
+            
             coalesced = _flatten_dense_tensors(grads)
+            if (args.low_bit_optimizer=='ourint8'):
+                coalesced=coalesced.mul_(1024.0).to(torch.int8)
             torch.distributed.all_reduce(
                 coalesced, group=mpu.get_tensor_model_parallel_group())
             for buf, synced in zip(grads, _unflatten_dense_tensors(
                     coalesced, grads)):
                 buf.copy_(synced)
+            if (args.low_bit_optimizer=='ourint8'): torch._foreach_div_(grads, 1024.0)
 
 
     def reduce_model_grads(self, args, timers):

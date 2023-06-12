@@ -853,14 +853,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             in enumerate(gbuf_view_items):
                 
             if self.grad_compression:
-                gbuf = gbuf.mul_(1024).to(torch.int8)
+                gbuf = gbuf.mul_(2048).to(torch.int8)
                 local_var = torch.empty_like(gbuf_views[data_parallel_rank], dtype=torch.int8)
                 torch.distributed.reduce_scatter_tensor(
                     local_var,
                     gbuf,
                     group = data_parallel_group,
                 )
-                gbuf_views[data_parallel_rank].copy_(local_var).div_(1024.0)
+                gbuf_views[data_parallel_rank].copy_(local_var).div_(2048.0)
             else:
                 torch.distributed.reduce_scatter_tensor(
                     gbuf_views[data_parallel_rank],
