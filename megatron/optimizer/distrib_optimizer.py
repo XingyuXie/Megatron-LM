@@ -6,6 +6,7 @@
 from apex.optimizers import FusedAdam as Adam
 import math
 import torch
+import time
 
 from megatron import get_args
 from megatron import get_timers
@@ -353,7 +354,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
                  params_have_main_grad, use_contiguous_buffers_in_local_ddp,
-                 fp16, bf16, params_dtype, grad_scaler, models):
+                 fp16, bf16, params_dtype, grad_scaler, models, grad_compression=False):
         """
         See top of class definition for argument descriptions.
 
@@ -368,6 +369,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             optimizer, clip_grad, log_num_zeros_in_grad,
             params_have_main_grad, use_contiguous_buffers_in_local_ddp,
             fp16, bf16, params_dtype, grad_scaler, models)
+        
+        self.grad_compression=grad_compression
 
         # Verify that contiguous buffers are being used.
         # - Note: this should already be checked in arguments.py.
@@ -818,7 +821,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         distributed optimizer, which reduces: 1) layernorm grads, 2) all
         grads, 3) embedding grads.
         """
-
+        
+        start_time = time.time()
         # All-reduce layer-norm grads (for sequence parallelism).
         timers('layernorm-grads-all-reduce', log_level=1).start(
             barrier=args.barrier_with_L1_time)
@@ -837,24 +841,35 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_rank = mpu.get_data_parallel_rank()
         data_parallel_world_size = mpu.get_data_parallel_world_size()
         data_parallel_group = mpu.get_data_parallel_group()
-
+        
         # Scale grad buffers by '1 / data_parallel_world_size'.
         for model in self.models:
             for dtype, gbuf in model._grad_buffers.items():
                 gbuf.data /= data_parallel_world_size
-
+                
         # Reduce-scatter all grads.
         gbuf_view_items = self.get_model_grad_buffer_dp_views()
         for index, (model_index, dtype, gbuf, gbuf_views) \
             in enumerate(gbuf_view_items):
-
-            torch.distributed._reduce_scatter_base(
-                gbuf_views[data_parallel_rank],
-                gbuf,
-                group = data_parallel_group,
-            )
-
+                
+            if self.grad_compression:
+                gbuf = gbuf.mul_(1024).to(torch.int8)
+                local_var = torch.empty_like(gbuf_views[data_parallel_rank], dtype=torch.int8)
+                torch.distributed.reduce_scatter_tensor(
+                    local_var,
+                    gbuf,
+                    group = data_parallel_group,
+                )
+                gbuf_views[data_parallel_rank].copy_(local_var).div_(1024.0)
+            else:
+                torch.distributed.reduce_scatter_tensor(
+                    gbuf_views[data_parallel_rank],
+                    gbuf,
+                    group = data_parallel_group,
+                )
         timers('grads-reduce-scatter').stop()
+        print_rank_0('done with grad reduce. Compilation time: {:.3f} seconds; grad compression is {}'
+              .format(time.time() - start_time, self.grad_compression))
 
 
     def gather_model_params(self, args, timers):

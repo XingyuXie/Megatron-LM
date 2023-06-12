@@ -154,7 +154,8 @@ def get_megatron_optimizer(model,
                       args.bf16,
                       args.params_dtype,
                       grad_scaler,
-                      model)
+                      model,
+                      grad_compression=(args.low_bit_optimizer=='ourint8'))
 
     # FP32.
     return FP32Optimizer(optimizer, args.clip_grad,

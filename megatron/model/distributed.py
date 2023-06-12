@@ -10,6 +10,7 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from megatron import get_args
 from megatron.core import mpu
 from .module import MegatronModule
+import time
 
 
 class MemoryBuffer:
@@ -206,6 +207,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
     def allreduce_gradients(self):
         """Reduce gradients across data parallel ranks."""
         # If we have buffers, simply reduce the data in the buffer.
+        start_time = time.time()
         if self._grad_buffers is not None:
             for _, buffer_ in self._grad_buffers.items():
                 if self.grad_compression:
@@ -249,3 +251,5 @@ class DistributedDataParallel(DistributedDataParallelBase):
                         coalesced, grads)):
                     buf.copy_(synced)
                     if self.grad_compression: buf.div_(1024.0)
+                    
+        print('done with grad reduce. Compilation time: {:.3f} seconds; grad compression is {}'.format(time.time() - start_time), self.grad_compression)

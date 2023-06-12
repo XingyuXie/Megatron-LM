@@ -779,7 +779,7 @@ def _add_training_args(parser):
                        'gradient computation of linear layers',
                        dest='gradient_accumulation_fusion')
     group.add_argument('--low-bit-optimizer', type=str, default='ourfp16',
-                       choices=['fp16', 'fp32', 'ourfp16', 'ori', 'none'],
+                       choices=['fp16', 'fp32', 'ourfp16', 'ourint8', 'ori', 'none'],
                         help='use the low-bit version of the base optimizer')
     return parser
 
