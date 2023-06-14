@@ -132,7 +132,7 @@ def get_megatron_optimizer(model,
 
         # Dynamic loss scale.
         else:
-            if args.fp16:
+            if args.fp16 or (args.low_bit_optimizer!='none'):
                 grad_scaler = DynamicGradScaler(
                     initial_scale=args.initial_loss_scale,
                     min_scale=args.min_loss_scale,
@@ -154,8 +154,7 @@ def get_megatron_optimizer(model,
                       args.bf16,
                       args.params_dtype,
                       grad_scaler,
-                      model,
-                      grad_compression=(args.low_bit_optimizer=='ourint8'))
+                      model)
 
     # FP32.
     return FP32Optimizer(optimizer, args.clip_grad,

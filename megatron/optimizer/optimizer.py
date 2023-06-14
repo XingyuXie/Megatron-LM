@@ -288,7 +288,8 @@ class MegatronOptimizer(ABC):
             for buf, synced in zip(grads, _unflatten_dense_tensors(
                     coalesced, grads)):
                 buf.copy_(synced)
-            if (args.low_bit_optimizer=='ourint8'): torch._foreach_div_(grads, 1024.0)
+                if (args.low_bit_optimizer=='ourint8'): 
+                    buf.div_(1024.0)
 
 
     def reduce_model_grads(self, args, timers):

@@ -67,7 +67,9 @@ class LowbitState:
         "refpoint_dict",
         "iter",
         "scale_step",
-        "scale_iter"
+        "scale_iter",
+        "compressed_info",
+        "compressed_flag"
     ]
 
     def __init__(
@@ -78,7 +80,7 @@ class LowbitState:
         error_beta=0.95,
         use_ref_point=True,
         ref_lr=1.0,
-        grad_scale= 32.0,
+        grad_scale= 512.0,
         scale_step = 2048
     ):
         logger.info(
@@ -120,6 +122,8 @@ class LowbitState:
         self.scale_iter = -1
         self.grad_scale = grad_scale
         self.scale_step = scale_step
+        self.compressed_info = torch.finfo(torch.bfloat16)
+        self.compressed_flag = torch.cuda.FloatTensor([0.0])
 
     def __getstate__(self):
         """
@@ -154,10 +158,22 @@ class LowbitState:
         if bucket.is_last():
             self.iter += 1
             self.scale_iter+=1
+            # bool_value = torch.tensor(self.compressed_flag).int()
+            dist.all_reduce(self.compressed_flag, op=torch.distributed.ReduceOp.MAX)
+            if self.compressed_flag.item() > 0:
+                self.grad_scale *= 0.5
+                self.grad_scale = max(self.grad_scale, 1e-8)
+                self.scale_iter = 0
+                
+            elif self.scale_iter > self.scale_step:
+                self.grad_scale *= 2.0
+                self.grad_scale = min(self.grad_scale, 2048)
+                self.scale_iter = 0
+            self.compressed_flag.fill_(0.0)
 
         if self.iter == self.start_lowbit_iter:
             logger.info(
-                "Start to apply PowerSGD after %s iterations.", self.iter
+                "Start to apply Low-bit Opt after %s iterations.", self.iter
             )
 
 
@@ -212,9 +228,6 @@ def lowbitopt_hook(
     if state.use_ref_point:
         if bucket_index in state.refpoint_dict:
             input_tensor.add_(state.refpoint_dict[bucket_index], alpha=-1.0)
-            # if torch.isnan(input_tensor).any():
-            #     print("ref point range is {} --- {}".format(torch.min(state.refpoint_dict[bucket_index]),torch.max(state.refpoint_dict[bucket_index])))
-            # assert not torch.isnan(input_tensor).any(), 'input tensor should not contain nan after ref point'
         else:
             logger.info(
                 "A zero tensor of length %s that represents global refrence point is created.",
@@ -239,16 +252,15 @@ def lowbitopt_hook(
     if state.use_ref_point or state.use_error_feedback:
         local_var = input_tensor.abs()
         
-    # 
-        
-    compressed_tensor = input_tensor.mul_(state.grad_scale/world_size).to(torch.int8)
+    #  
+    compressed_tensor = input_tensor.mul_(state.grad_scale/world_size).to(torch.bfloat16)
     # if torch.isinf(compressed_tensor).any():
     #     print("input tensor range is {} --- {}".format(torch.min(input_tensor),torch.max(input_tensor)))
     #     print("scale_factor is {}".format(state.grad_scale))
     # assert not torch.isinf(compressed_tensor).any(), 'local grad should not contain inf'
     if state.use_error_feedback:
         local_var.copy_(compressed_tensor)
-        input_tensor.add(local_var,alpha=-1.0).mul_(world_size/state.grad_scale)
+        input_tensor.add(local_var,alpha=-1.0).div_(state.grad_scale/world_size)
         state.error_dict[bucket_index].lerp_(input_tensor, 1.-state.error_beta)
         # implememt err*state.error_beta + (1-error_beta)*(input_tensor-compressed_tensor)/scale
         # state.error_dict[bucket_index].mul_(state.error_beta)
@@ -268,51 +280,62 @@ def lowbitopt_hook(
         # Decompress in place to reduce the peak memory.
         # See: https://github.com/pytorch/pytorch/issues/45968
         grads.copy_(fut.value()[0])
+        
+        # 检测是否存在inf或者-inf
+        if torch.isinf(grads).any():
+            state.compressed_flag+=1
+            grads.clamp(min=state.compressed_info.min,
+                        max=state.compressed_info.max)
+            
         grads.div_(state.grad_scale)
+
+
         # assert not torch.isinf(grads).any(), 'grad after all reduce contain INF'
         if state.use_ref_point:
             grads.add_(state.refpoint_dict[bucket_index], alpha=state.ref_lr)
             # h_g_sgn = grads.sign()
             state.refpoint_dict[bucket_index].copy_(grads)
-            # state.refpoint_dict[bucket_index].div_(1.0+state.ref_lr)
+            state.refpoint_dict[bucket_index].div_(1.0+state.ref_lr)
             
-            # assert not torch.isnan(state.refpoint_dict[bucket_index]).any(), 'Ref Point 0 should not contain nan'
-            torch.abs(grads, out=local_var)
-            local_var.mul_(4).add_(state.ref_lr**2).sqrt_().add_(state.ref_lr)
-            # assert not torch.isnan(local_var).any(), 'local_var should not contain nan'
-            state.refpoint_dict[bucket_index].mul_(2.0).div_(local_var)
-            # if torch.isnan(state.refpoint_dict[bucket_index]).any():
-            #     print("local var range is {} --- {}".format(torch.min(local_var),torch.max(local_var)))
-            # assert not torch.isnan(state.refpoint_dict[bucket_index]).any(), 'Ref Point 1 should not contain nan'
-            torch.abs(grads, out=local_var)
-            state.refpoint_dict[bucket_index].square_().mul_(local_var)
-            # assert not torch.isinf(state.refpoint_dict[bucket_index]).any(), 'Ref Point 2 should not contain inf'
+            # # assert not torch.isnan(state.refpoint_dict[bucket_index]).any(), 'Ref Point 0 should not contain nan'
+            # torch.abs(grads, out=local_var)
+            # local_var.mul_(4).add_(state.ref_lr**2).sqrt_().add_(state.ref_lr)
+            # # assert not torch.isnan(local_var).any(), 'local_var should not contain nan'
+            # state.refpoint_dict[bucket_index].mul_(2.0).div_(local_var)
+            # # if torch.isnan(state.refpoint_dict[bucket_index]).any():
+            # #     print("local var range is {} --- {}".format(torch.min(local_var),torch.max(local_var)))
+            # # assert not torch.isnan(state.refpoint_dict[bucket_index]).any(), 'Ref Point 1 should not contain nan'
+            # torch.abs(grads, out=local_var)
+            # state.refpoint_dict[bucket_index].square_().mul_(local_var)
+            # # if torch.max(local_var) * state.grad_scale * 1.1 >= state.compressed_info.max:
+            # #     state.compressed_flag=True
+            # # assert not torch.isinf(state.refpoint_dict[bucket_index]).any(), 'Ref Point 2 should not contain inf'
             
 
         
         state.maybe_increase_iter(bucket)
-        safe_scale_factor(local_var, state)
+        # safe_scale_factor(local_var, state)
         # print("Finsh our step {}".format(state.iter)    )
         return grads
 
     return fut.then(decompress)
 
 
-def safe_scale_factor(tensor, state: LowbitState, max_float16=torch.finfo(torch.float16).max, eps=1e-6):
+def safe_scale_factor(state: LowbitState):
     # assert that input tensor does not contain INF
     # assert not torch.isinf(tensor).any(), 'gradient tensor should not contain INF'
-    tensor_max = torch.max(tensor.abs()) + eps
+    # tensor_max = torch.max(tensor.abs()) + eps
 
     # keep halving state.grad_scale until tensor_max * state.grad_scale < max_float16
-    while tensor_max * state.grad_scale >= max_float16:
+    # while tensor_max * state.grad_scale >= max_float16:
+    if state.compressed_flag:
         state.grad_scale *= 0.5
-        if state.grad_scale < 1.0: 
-            state.grad_scale = 1.0
-            break
-        state.scale_iter = -1
+        if state.grad_scale < 1e-4: 
+            state.grad_scale = 1e-4
+            # break
+        state.scale_iter = 0
         
-    state.scale_iter += 1
-    if state.scale_iter > state.scale_step:
+    elif state.scale_iter > state.scale_step:
         state.grad_scale *= 2.0
         state.scale_iter = 0
 
