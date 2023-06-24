@@ -299,6 +299,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 if args.low_bit_optimizer=='ourfp16':
                     lowbit_state = LowbitState(process_group=mpu.get_data_parallel_group(),error_beta=args.adam_beta2)
                     DDP_module.register_comm_hook(lowbit_state, lowbitopt_hook)
+                    setattr(DDP_module, "LowbitState", lowbit_state)
                 elif args.low_bit_optimizer=='fp16':
                     DDP_module.register_comm_hook(state=mpu.get_data_parallel_group(), hook=fp16_compress_hook)
                 elif args.low_bit_optimizer=='fp32':
@@ -315,7 +316,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             model = [LocalDDP(model_module,
                               args.accumulate_allreduce_grads_in_fp32,
                               args.use_contiguous_buffers_in_local_ddp,
-                              grad_compression=(args.low_bit_optimizer=='ourfp16'))
+                              grad_compression=(args.low_bit_optimizer=='outint8'))
                      for model_module in model]
             # broad cast params from data parallel src rank to other data parallel ranks
             if args.data_parallel_random_init:

@@ -225,12 +225,14 @@ class MegatronOptimizer(ABC):
                     grad = word_embeddings_weight.main_grad
                 else:
                     grad = word_embeddings_weight.grad
-                if (args.low_bit_optimizer=='ourint8'):
-                    local_var = grad.mul_(1024.0).to(torch.int8)
-                    torch.distributed.all_reduce(local_var, group=mpu.get_embedding_group())
-                    grad.copy_(local_var).div_(1024.0)
-                else:
-                    torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
+                    
+                torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
+                # if (args.low_bit_optimizer=='ourint8'):
+                #     local_var = grad.mul_(1024.0).to(torch.int8)
+                #     torch.distributed.all_reduce(local_var, group=mpu.get_embedding_group())
+                #     grad.copy_(local_var).div_(1024.0)
+                # else:
+                #     torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
 
 
     def allreduce_position_embedding_grads(self, args):
@@ -249,12 +251,13 @@ class MegatronOptimizer(ABC):
             assert args.DDP_impl == 'local', \
                 'T5 model is only supported with local DDP mode'
             grad = unwrapped_model.language_model.embedding.position_embeddings.weight.main_grad
-            if (args.low_bit_optimizer=='ourint8'):
-                local_var = grad.mul_(1024.0).to(torch.int8)
-                torch.distributed.all_reduce(local_var, group=mpu.get_position_embedding_group())
-                grad.copy_(local_var).div_(1024.0)
-            else:
-                torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
+            torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
+            # if (args.low_bit_optimizer=='ourint8'):
+            #     local_var = grad.mul_(1024.0).to(torch.int8)
+            #     torch.distributed.all_reduce(local_var, group=mpu.get_position_embedding_group())
+            #     grad.copy_(local_var).div_(1024.0)
+            # else:
+            #     torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
             
 
 
@@ -281,15 +284,15 @@ class MegatronOptimizer(ABC):
                         grads.append(grad.data)
             
             coalesced = _flatten_dense_tensors(grads)
-            if (args.low_bit_optimizer=='ourint8'):
-                coalesced=coalesced.mul_(1024.0).to(torch.int8)
+            # if (args.low_bit_optimizer=='ourint8'):
+            #     coalesced=coalesced.mul_(1024.0).to(torch.int8)
             torch.distributed.all_reduce(
                 coalesced, group=mpu.get_tensor_model_parallel_group())
             for buf, synced in zip(grads, _unflatten_dense_tensors(
                     coalesced, grads)):
                 buf.copy_(synced)
-                if (args.low_bit_optimizer=='ourint8'): 
-                    buf.div_(1024.0)
+                # if (args.low_bit_optimizer=='ourint8'): 
+                #     buf.div_(1024.0)
 
 
     def reduce_model_grads(self, args, timers):
@@ -737,7 +740,33 @@ class FP32Optimizer(MegatronOptimizer):
     def step(self, args, timers):
         """Clip gradients (if needed) and step the base optimizer.
         Always return successful since there is no overflow."""
-
+        
+        for model_module in self.models:
+            if hasattr(model_module, "LowbitState"):
+                # Update across all model parallel instances.
+                torch.distributed.all_reduce(model_module.LowbitState.compressed_flag,
+                                             op=torch.distributed.ReduceOp.MAX,
+                                             group=self.get_model_parallel_group())
+                
+                if model_module.LowbitState.compressed_flag.item() > 0:
+                    # Reset found inf.
+                    model_module.LowbitState.compressed_flag.fill_(0.0)
+                    model_module.LowbitState.grad_scale*=0.5
+                    print_rank_0("sync iter: {}, grad overflow; decay the LowbitState grad_scale to {}"
+                                 .format(model_module.LowbitState.iter
+                                         ,model_module.LowbitState.grad_scale)
+                                )
+                    model_module.LowbitState.scale_iter=0.0
+                    return False, None, None
+                elif model_module.LowbitState.scale_iter > model_module.LowbitState.scale_step:
+                    model_module.LowbitState.grad_scale*=2.0
+                    print_rank_0("sync iter: {}, scale update; increase the LowbitState grad_scale to {}"
+                                 .format(model_module.LowbitState.iter
+                                         ,model_module.LowbitState.grad_scale)
+                                )
+                    model_module.LowbitState.scale_iter=0.0
+            #     self.grad_scale *= 2.0
+                
         # Copy main_grads to grads.
         timers('optimizer-copy-to-main-grad', log_level=1).start(
             barrier=args.barrier_with_L1_time)

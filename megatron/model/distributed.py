@@ -101,6 +101,8 @@ class DistributedDataParallel(DistributedDataParallelBase):
         self.use_contiguous_buffers = use_contiguous_buffers
         self.grad_compression=grad_compression
         if self.grad_compression:
+            self._local_error_feedbacks = None
+            self._local_ref_points = None
             print("We will compresse grad to int8!!!")
         # If we are using fp32-accumulate-allreduce explicitly
         # this means we need main grads in a continous buffer.
@@ -115,6 +117,9 @@ class DistributedDataParallel(DistributedDataParallelBase):
         self._grad_buffer_param_index_map = None
         if self.use_contiguous_buffers:
             self._grad_buffers = {}
+            if self.grad_compression: 
+                self._local_error_feedbacks = {}
+                self._local_ref_points = {}
             self._grad_buffer_param_index_map = {}
             data_parallel_world_size = mpu.get_data_parallel_world_size()
 
@@ -145,6 +150,14 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 self._grad_buffers[dtype] = MemoryBuffer(num_elements,
                                                          num_elements_padded,
                                                          dtype)
+                if self.grad_compression and \
+                    dtype not in (torch.int8, torch.int16, torch.int32, torch.int64): 
+                    self._local_error_feedbacks[dtype] = MemoryBuffer(num_elements,
+                                                            num_elements_padded,
+                                                            dtype)
+                    self._local_ref_points[dtype] = MemoryBuffer(num_elements,
+                                                            num_elements_padded,
+                                                            dtype)
 
             # Assume the back prop order is reverse the params order,
             # store the start index for the gradients.

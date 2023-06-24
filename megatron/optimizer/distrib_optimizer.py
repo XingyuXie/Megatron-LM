@@ -354,7 +354,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
                  params_have_main_grad, use_contiguous_buffers_in_local_ddp,
-                 fp16, bf16, params_dtype, grad_scaler, models, grad_compression=False):
+                 fp16, bf16, params_dtype, grad_scaler, models):
         """
         See top of class definition for argument descriptions.
 
@@ -370,7 +370,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             params_have_main_grad, use_contiguous_buffers_in_local_ddp,
             fp16, bf16, params_dtype, grad_scaler, models)
         
-        self.grad_compression=grad_compression
 
         # Verify that contiguous buffers are being used.
         # - Note: this should already be checked in arguments.py.
@@ -851,25 +850,29 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         gbuf_view_items = self.get_model_grad_buffer_dp_views()
         for index, (model_index, dtype, gbuf, gbuf_views) \
             in enumerate(gbuf_view_items):
-                
-            if self.grad_compression:
-                gbuf = gbuf.mul_(2048).to(torch.int8)
-                local_var = torch.empty_like(gbuf_views[data_parallel_rank], dtype=torch.int8)
-                torch.distributed.reduce_scatter_tensor(
-                    local_var,
-                    gbuf,
-                    group = data_parallel_group,
-                )
-                gbuf_views[data_parallel_rank].copy_(local_var).div_(2048.0)
-            else:
                 torch.distributed.reduce_scatter_tensor(
                     gbuf_views[data_parallel_rank],
                     gbuf,
                     group = data_parallel_group,
                 )
+            # if self.grad_compression:
+            #     gbuf = gbuf.mul_(2048).to(torch.int8)
+            #     local_var = torch.empty_like(gbuf_views[data_parallel_rank], dtype=torch.int8)
+            #     torch.distributed.reduce_scatter_tensor(
+            #         local_var,
+            #         gbuf,
+            #         group = data_parallel_group,
+            #     )
+            #     gbuf_views[data_parallel_rank].copy_(local_var).div_(2048.0)
+            # else:
+            #     torch.distributed.reduce_scatter_tensor(
+            #         gbuf_views[data_parallel_rank],
+            #         gbuf,
+            #         group = data_parallel_group,
+            #     )
         timers('grads-reduce-scatter').stop()
-        print_rank_0('done with grad reduce. Compilation time: {:.3f} seconds; grad compression is {}'
-              .format(time.time() - start_time, self.grad_compression))
+        # print_rank_0('done with grad reduce. Compilation time: {:.3f} seconds; grad compression is {}'
+        #       .format(time.time() - start_time, self.grad_compression))
 
 
     def gather_model_params(self, args, timers):

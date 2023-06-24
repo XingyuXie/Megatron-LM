@@ -8,6 +8,7 @@ from .lowbithook import LowbitHook
 from megatron import get_args
 
 from .distrib_optimizer import DistributedOptimizer
+from .compressed_optimizer import CompressedDistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
 
@@ -132,7 +133,7 @@ def get_megatron_optimizer(model,
 
         # Dynamic loss scale.
         else:
-            if args.fp16 or (args.low_bit_optimizer!='none'):
+            if args.fp16:
                 grad_scaler = DynamicGradScaler(
                     initial_scale=args.initial_loss_scale,
                     min_scale=args.min_loss_scale,
@@ -142,9 +143,12 @@ def get_megatron_optimizer(model,
                     hysteresis=args.hysteresis)
 
         # Megatron optimizer.
-        opt_ty = DistributedOptimizer \
-            if args.use_distributed_optimizer else \
-            Float16OptimizerWithFloat16Params
+        if args.use_distributed_optimizer:
+            opt_ty = CompressedDistributedOptimizer \
+                if (args.low_bit_optimizer=='outint8') \
+                else DistributedOptimizer
+        else:
+            opt_ty = Float16OptimizerWithFloat16Params
         return opt_ty(optimizer,
                       args.clip_grad,
                       args.log_num_zeros_in_grad,

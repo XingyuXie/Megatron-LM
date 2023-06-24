@@ -4,6 +4,7 @@
 
 import torch
 from typing import Optional
+from ..tree import build_tree_group
 
 from .utils import GlobalMemoryBuffer
 
@@ -19,6 +20,7 @@ _EMBEDDING_GROUP = None
 _POSITION_EMBEDDING_GROUP = None
 # Data parallel group that the current rank belongs to.
 _DATA_PARALLEL_GROUP = None
+_DATA_PARALLEL_GROUP_TREE = None
 _DATA_PARALLEL_GROUP_GLOO = None
 # FP8 amax reduction group.
 _AMAX_REDUCTION_GROUP = None
@@ -151,6 +153,7 @@ def initialize_model_parallel(
     rank = torch.distributed.get_rank()
 
     # Build the data-parallel groups.
+    global _DATA_PARALLEL_GROUP_TREE
     global _DATA_PARALLEL_GROUP
     global _DATA_PARALLEL_GROUP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS
@@ -164,7 +167,9 @@ def initialize_model_parallel(
             all_data_parallel_group_ranks.append(list(ranks))
             group = torch.distributed.new_group(ranks)
             group_gloo = torch.distributed.new_group(ranks, backend="gloo")
+            group_tree = build_tree_group(ranks)
             if rank in ranks:
+                _DATA_PARALLEL_GROUP_TREE = group_tree
                 _DATA_PARALLEL_GROUP = group
                 _DATA_PARALLEL_GROUP_GLOO = group_gloo
                 _DATA_PARALLEL_GLOBAL_RANKS = ranks
@@ -269,7 +274,8 @@ def model_parallel_is_initialized():
     """Check if model and data parallel groups are initialized."""
     if _TENSOR_MODEL_PARALLEL_GROUP is None or \
         _PIPELINE_MODEL_PARALLEL_GROUP is None or \
-        _DATA_PARALLEL_GROUP is None:
+        _DATA_PARALLEL_GROUP is None or \
+        _DATA_PARALLEL_GROUP_TREE is None:
         return False
     return True
 
@@ -300,6 +306,12 @@ def get_data_parallel_group():
     assert _DATA_PARALLEL_GROUP is not None, \
         'data parallel group is not initialized'
     return _DATA_PARALLEL_GROUP
+
+def get_data_parallel_group_tree():
+    """Get the data parallel group the caller rank belongs to."""
+    assert _DATA_PARALLEL_GROUP_TREE is not None, \
+        'data parallel group is not initialized'
+    return _DATA_PARALLEL_GROUP_TREE
 
 
 def get_data_parallel_group_gloo():
@@ -591,6 +603,8 @@ def destroy_model_parallel():
     _PIPELINE_MODEL_PARALLEL_GROUP = None
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None
+    global _DATA_PARALLEL_GROUP_TREE
+    _DATA_PARALLEL_GROUP_TREE = None
     global _EMBEDDING_GROUP
     _EMBEDDING_GROUP = None
     global _POSITION_EMBEDDING_GROUP
