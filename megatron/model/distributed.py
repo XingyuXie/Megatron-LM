@@ -102,7 +102,13 @@ class DistributedDataParallel(DistributedDataParallelBase):
         self.grad_compression=grad_compression
         if self.grad_compression:
             self._local_error_feedbacks = None
+            self._lowbit_grad_buffers = None
             self._local_ref_points = None
+            self._before_opt_step = False
+            self.lowbit_scale = 65535.0
+            self.lowbit_gap = 2048
+            self.error_beta = 0.95
+            self.ref_lr = 1.0
             print("We will compresse grad to int8!!!")
         # If we are using fp32-accumulate-allreduce explicitly
         # this means we need main grads in a continous buffer.
@@ -120,6 +126,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
             if self.grad_compression: 
                 self._local_error_feedbacks = {}
                 self._local_ref_points = {}
+                self._lowbit_grad_buffers = {}
             self._grad_buffer_param_index_map = {}
             data_parallel_world_size = mpu.get_data_parallel_world_size()
 
@@ -158,6 +165,9 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     self._local_ref_points[dtype] = MemoryBuffer(num_elements,
                                                             num_elements_padded,
                                                             dtype)
+                    self._lowbit_grad_buffers[dtype] = MemoryBuffer(num_elements,
+                                                            num_elements_padded,
+                                                            torch.int8)
 
             # Assume the back prop order is reverse the params order,
             # store the start index for the gradients.
@@ -167,6 +177,16 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     type_num_elements[dtype] -= param.data.nelement()
                     param.main_grad = self._grad_buffers[dtype].get(
                         param.data.shape, type_num_elements[dtype])
+                    if self._local_error_feedbacks[dtype] is not None:
+                        param.local_error = \
+                            self._local_error_feedbacks[dtype].get(
+                            param.data.shape, type_num_elements[dtype])
+                        param.local_ref = \
+                            self._local_ref_points[dtype].get(
+                            param.data.shape, type_num_elements[dtype])
+                        param.lowbit_grad = \
+                            self._lowbit_grad_buffers[dtype].get(
+                            param.data.shape, type_num_elements[dtype])
                     if dtype not in self._grad_buffer_param_index_map:
                         self._grad_buffer_param_index_map[dtype] = {}
                     self._grad_buffer_param_index_map[dtype][param] = (
@@ -197,6 +217,23 @@ class DistributedDataParallel(DistributedDataParallelBase):
             if param.grad is not None:
                 # The gradient function of linear layers is fused with GEMMs
                 param.main_grad.add_(param.grad.data)
+                if self._before_opt_step and hasattr(param, 'local_error'):
+                    data_parallel_world_size = mpu.get_data_parallel_world_size()
+                    param.main_grad.add_(param.local_ref, alpha=-self.ref_lr)
+                    param.grad.copy_(param.main_grad)
+                    local_var = param.grad
+                    # local_var.zero_().add_(gbuf)
+                    local_var.add_(param.local_error)
+                    compressed_tensor = local_var.mul_(self.lowbit_scale/data_parallel_world_size).to(torch.int8)
+                    param.lowbit_grad.copy_(compressed_tensor)
+                    # update error
+                    local_var.copy_(compressed_tensor).div_(-self.lowbit_scale/data_parallel_world_size)
+                    local_var.add_(param.main_grad)
+                    param.local_error.add_(local_var, 1.-self.error_beta)
+                    # # update ref point
+                    # param.local_ref.add_(param.main_grad) 
+                    compressed_tensor=None
+                    
                 # Now we can deallocate grad memory.
                 param.grad = None
         return param_hook

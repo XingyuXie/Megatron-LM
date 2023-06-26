@@ -316,7 +316,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             model = [LocalDDP(model_module,
                               args.accumulate_allreduce_grads_in_fp32,
                               args.use_contiguous_buffers_in_local_ddp,
-                              grad_compression=(args.low_bit_optimizer=='outint8'))
+                              grad_compression=(args.low_bit_optimizer=='ourint8'))
                      for model_module in model]
             # broad cast params from data parallel src rank to other data parallel ranks
             if args.data_parallel_random_init:
@@ -492,7 +492,7 @@ def train_step(forward_step_func, data_iterator,
     # Empty unused memory.
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
-
+    
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
         loss_reduced = {}
@@ -500,6 +500,10 @@ def train_step(forward_step_func, data_iterator,
             losses_reduced_for_key = [x[key] for x in losses_reduced]
             loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
         return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
+
+    if hasattr(model, '_before_opt_step'):
+        model._before_opt_step = False
+        
     return {}, skipped_iter, grad_norm, num_zeros_in_grad
 
 

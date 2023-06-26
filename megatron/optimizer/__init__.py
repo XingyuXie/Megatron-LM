@@ -8,7 +8,7 @@ from .lowbithook import LowbitHook
 from megatron import get_args
 
 from .distrib_optimizer import DistributedOptimizer
-from .compressed_optimizer import CompressedDistributedOptimizer
+from .compressed_optimizer2 import CompressedDistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
 
@@ -145,7 +145,7 @@ def get_megatron_optimizer(model,
         # Megatron optimizer.
         if args.use_distributed_optimizer:
             opt_ty = CompressedDistributedOptimizer \
-                if (args.low_bit_optimizer=='outint8') \
+                if (args.low_bit_optimizer=='ourint8') \
                 else DistributedOptimizer
         else:
             opt_ty = Float16OptimizerWithFloat16Params
