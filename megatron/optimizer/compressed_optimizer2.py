@@ -96,15 +96,18 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
                 shard_size = int(buf.numel() / data_parallel_world_size)
                 buf_views = [buf[(r*shard_size):((r+1)*shard_size)]
                              for r in range(data_parallel_world_size)]
-                if lowbit_grad_buf_views is not None:
-                    lowbit_grad_buf_views = [lowbit_grad_buf[(r*shard_size):((r+1)*shard_size)]
-                                for r in range(data_parallel_world_size)] 
+                
+                if ref_buf is not None:
+                    ref_buf = ref_buf.data
+                    lowbit_grad_buf = lowbit_grad_buf.data
                     ref_buf_views = [ref_buf[(r*shard_size):((r+1)*shard_size)]
+                             for r in range(data_parallel_world_size)]
+                    lowbit_grad_buf_views = [lowbit_grad_buf[(r*shard_size):((r+1)*shard_size)]
                              for r in range(data_parallel_world_size)]
                     view_items.append((model_index, dtype, 
                                        buf, buf_views,
-                                       lowbit_grad_buf, lowbit_grad_buf_views,
-                                       ref_buf, ref_buf_views,
+                                       ref_buf,ref_buf_views,
+                                       lowbit_grad_buf,lowbit_grad_buf_views,
                                        model.lowbit_scale, model.ref_lr))
                 else:
                     view_items.append((model_index, dtype, 
@@ -155,11 +158,11 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
         gbuf_view_items = self.get_lowbit_buffer_dp_views()
         for index, (model_index, dtype,
                     gbuf, gbuf_views,
-                    lowbit_grad_buf, lowbit_grad_buf_views,
                     ref_buf, ref_buf_views,
+                    lowbit_grad_buf, lowbit_grad_buf_views,
                     lowbit_scale, ref_lr) \
             in enumerate(gbuf_view_items):
-            if lowbit_grad_buf is None:
+            if ref_buf is None:
                 torch.distributed.reduce_scatter_tensor(
                     gbuf_views[data_parallel_rank],
                     gbuf.div_(data_parallel_world_size),
@@ -167,16 +170,19 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
                 )
                 continue
             
+            compressed_tensor_views = lowbit_grad_buf_views[data_parallel_rank]
+            
             torch.distributed.reduce_scatter_tensor(
-                    lowbit_grad_buf_views[data_parallel_rank],
-                    lowbit_grad_buf,
-                    group = data_parallel_group,
+                compressed_tensor_views,
+                lowbit_grad_buf,
+                group = data_parallel_group,
             )
             gbuf_views[data_parallel_rank].\
-                copy_(lowbit_grad_buf_views[data_parallel_rank]).\
-                div_(lowbit_scale)
+                copy_(compressed_tensor_views).div_(lowbit_scale)
 
             # update refer point
+            # print_rank_0('now {}; ref dtype {}; gbuf dtype {}'.
+            #              format(dtype, ref_buf.dtype, gbuf.dtype))
             ref_buf.add_(gbuf)
             gbuf_views[data_parallel_rank].copy_(ref_buf_views[data_parallel_rank])
 
@@ -196,7 +202,7 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
 
     @torch.no_grad()
     def step(self, args, timers):
-        update_flag, grad_norm, num_zeros_in_grad = super().step(self, args, timers)
+        update_flag, grad_norm, num_zeros_in_grad = super().step(args, timers)
         if self.pre_loss_scale != self.grad_scaler.scale:
             scale_change = self.grad_scaler.scale/self.pre_loss_scale
             for model_index, model in enumerate(self.models):

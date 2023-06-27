@@ -821,7 +821,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         grads, 3) embedding grads.
         """
         
-        start_time = time.time()
+        # start_time = time.time()
         # All-reduce layer-norm grads (for sequence parallelism).
         timers('layernorm-grads-all-reduce', log_level=1).start(
             barrier=args.barrier_with_L1_time)
@@ -856,14 +856,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     group = data_parallel_group,
                 )
             # if self.grad_compression:
-            #     gbuf = gbuf.mul_(2048).to(torch.int8)
-            #     local_var = torch.empty_like(gbuf_views[data_parallel_rank], dtype=torch.int8)
-            #     torch.distributed.reduce_scatter_tensor(
-            #         local_var,
-            #         gbuf,
-            #         group = data_parallel_group,
-            #     )
-            #     gbuf_views[data_parallel_rank].copy_(local_var).div_(2048.0)
+                # gbuf = gbuf.mul_(4096).to(torch.int8)
+                # local_var = torch.empty_like(gbuf_views[data_parallel_rank], dtype=torch.int8)
+                # torch.distributed.reduce_scatter_tensor(
+                #     local_var,
+                #     gbuf,
+                #     group = data_parallel_group,
+                # )
+                # gbuf_views[data_parallel_rank].copy_(local_var).div_(4096.0)
             # else:
             #     torch.distributed.reduce_scatter_tensor(
             #         gbuf_views[data_parallel_rank],

@@ -100,12 +100,12 @@ class DistributedDataParallel(DistributedDataParallelBase):
             = accumulate_allreduce_grads_in_fp32
         self.use_contiguous_buffers = use_contiguous_buffers
         self.grad_compression=grad_compression
+        self._before_opt_step = False
         if self.grad_compression:
             self._local_error_feedbacks = None
             self._lowbit_grad_buffers = None
             self._local_ref_points = None
-            self._before_opt_step = False
-            self.lowbit_scale = 65535.0
+            self.lowbit_scale = 32768.0
             self.lowbit_gap = 2048
             self.error_beta = 0.95
             self.ref_lr = 1.0
@@ -177,7 +177,12 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     type_num_elements[dtype] -= param.data.nelement()
                     param.main_grad = self._grad_buffers[dtype].get(
                         param.data.shape, type_num_elements[dtype])
-                    if self._local_error_feedbacks[dtype] is not None:
+                    if self.grad_compression and \
+                    dtype not in (torch.int8, torch.int16, torch.int32, torch.int64): 
+                        # param.local_error = \
+                        #     torch.zeros_like(param.main_grad, dtype=dtype)
+                        # param.local_ref = \
+                        #     torch.zeros_like(param.main_grad, dtype=dtype)
                         param.local_error = \
                             self._local_error_feedbacks[dtype].get(
                             param.data.shape, type_num_elements[dtype])
@@ -217,7 +222,20 @@ class DistributedDataParallel(DistributedDataParallelBase):
             if param.grad is not None:
                 # The gradient function of linear layers is fused with GEMMs
                 param.main_grad.add_(param.grad.data)
-                if self._before_opt_step and hasattr(param, 'local_error'):
+                if self._before_opt_step and hasattr(param, 'local_ref'):
+                    # data_parallel_world_size = mpu.get_data_parallel_world_size()
+                    # param.grad.copy_(param.main_grad)
+                    # local_var = param.grad
+                    # # local_var.zero_().add_(gbuf)
+                    # local_var.add_(param.local_ref)
+                    
+                    # compressed_tensor = local_var.mul_(self.lowbit_scale/data_parallel_world_size).to(torch.int8)
+                    
+                    # local_var.copy_(compressed_tensor).div_(-self.lowbit_scale/data_parallel_world_size)
+                    
+                    # param.local_ref.add_(param.main_grad,  alpha=self.ref_lr/(1.0+self.ref_lr))
+                    # param.local_ref.add_(local_var,  alpha=-1.+self.error_beta)
+                    
                     data_parallel_world_size = mpu.get_data_parallel_world_size()
                     param.main_grad.add_(param.local_ref, alpha=-self.ref_lr)
                     param.grad.copy_(param.main_grad)
@@ -229,9 +247,11 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     # update error
                     local_var.copy_(compressed_tensor).div_(-self.lowbit_scale/data_parallel_world_size)
                     local_var.add_(param.main_grad)
-                    param.local_error.add_(local_var, 1.-self.error_beta)
-                    # # update ref point
-                    # param.local_ref.add_(param.main_grad) 
+                    param.local_error.add_(local_var, alpha=1.-self.error_beta)
+                    
+                    # update ref
+                    
+                    # param.main_grad.copy_(compressed_tensor)
                     compressed_tensor=None
                     
                 # Now we can deallocate grad memory.

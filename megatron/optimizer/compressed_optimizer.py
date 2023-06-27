@@ -165,7 +165,7 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
                     group = data_parallel_group,
                 )
                 timers('grads-reduce-scatter').stop()
-                return
+                continue
             if use_ref_point:
                 if scale_change is not None:
                     ref_buf.mul_(scale_change)
