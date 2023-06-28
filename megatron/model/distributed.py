@@ -15,13 +15,13 @@ import time
 
 class MemoryBuffer:
 
-    def __init__(self, numel, numel_padded, dtype):
+    def __init__(self, numel, numel_padded, dtype, device = torch.cuda.current_device()):
         self.numel = numel
         self.numel_padded = numel_padded
         self.dtype = dtype
         self.data = torch.zeros(self.numel_padded,
                                 dtype=self.dtype,
-                                device=torch.cuda.current_device(),
+                                device=device,
                                 requires_grad=False)
 
     def zero(self):
@@ -161,16 +161,18 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     dtype not in (torch.int8, torch.int16, torch.int32, torch.int64): 
                     self._local_error_feedbacks[dtype] = MemoryBuffer(num_elements,
                                                             num_elements_padded,
-                                                            dtype)
+                                                            dtype, device="cpu")
                     self._local_ref_points[dtype] = MemoryBuffer(num_elements,
                                                             num_elements_padded,
-                                                            dtype)
+                                                            dtype, device="cpu")
                     self._lowbit_grad_buffers[dtype] = MemoryBuffer(num_elements,
                                                             num_elements_padded,
                                                             torch.int8)
 
             # Assume the back prop order is reverse the params order,
             # store the start index for the gradients.
+            # self.main_grad_list = []
+            # self.ref_point_list = []
             for param in self.module.parameters():
                 if param.requires_grad:
                     dtype = _get_buffer_type(param)
@@ -183,6 +185,8 @@ class DistributedDataParallel(DistributedDataParallelBase):
                         #     torch.zeros_like(param.main_grad, dtype=dtype)
                         # param.local_ref = \
                         #     torch.zeros_like(param.main_grad, dtype=dtype)
+                        # self.main_grad_list.append(param.main_grad)
+                        # self.ref_point_list.append(param.local_ref)
                         param.local_error = \
                             self._local_error_feedbacks[dtype].get(
                             param.data.shape, type_num_elements[dtype])
@@ -235,24 +239,30 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     
                     # param.local_ref.add_(param.main_grad,  alpha=self.ref_lr/(1.0+self.ref_lr))
                     # param.local_ref.add_(local_var,  alpha=-1.+self.error_beta)
-                    
+                    local_ref = param.local_ref.to(param.main_grad, non_blocking=True)
+                    local_error = param.local_error.to(param.main_grad, non_blocking=True)
                     data_parallel_world_size = mpu.get_data_parallel_world_size()
-                    param.main_grad.add_(param.local_ref, alpha=-self.ref_lr)
+                    param.main_grad.add_(local_ref.div_(1+self.ref_lr), alpha=-self.ref_lr)
                     param.grad.copy_(param.main_grad)
                     local_var = param.grad
                     # local_var.zero_().add_(gbuf)
-                    local_var.add_(param.local_error)
+                    local_var.add_(local_error)
                     compressed_tensor = local_var.mul_(self.lowbit_scale/data_parallel_world_size).to(torch.int8)
                     param.lowbit_grad.copy_(compressed_tensor)
                     # update error
                     local_var.copy_(compressed_tensor).div_(-self.lowbit_scale/data_parallel_world_size)
                     local_var.add_(param.main_grad)
-                    param.local_error.add_(local_var, alpha=1.-self.error_beta)
+                    local_error.add_(local_var, alpha=1.-self.error_beta)
                     
                     # update ref
-                    
+                    # param.local_ref.add_(param.main_grad)
                     # param.main_grad.copy_(compressed_tensor)
+                    
+                    # param.local_ref = param.local_ref.to("cpu", non_blocking=True)
+                    param.local_error.copy_(local_error.to("cpu", non_blocking=True))
                     compressed_tensor=None
+                    local_error = None
+                    local_ref = None
                     
                 # Now we can deallocate grad memory.
                 param.grad = None

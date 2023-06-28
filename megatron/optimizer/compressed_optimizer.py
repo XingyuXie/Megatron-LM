@@ -91,6 +91,7 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
                 buf = mem_buffer.data
                 assert buf.numel() % data_parallel_world_size == 0
                 err_buf = model._local_error_feedbacks.get(dtype)
+                if err_buf is not None: err_buf = err_buf.data
                 ref_buf = model._local_ref_points.get(dtype)
                 # local_var_buf = model._local_vars.get(dtype)
                 shard_size = int(buf.numel() / data_parallel_world_size)
@@ -99,9 +100,11 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
                 # err_buf_views = [err_buf[(r*shard_size):((r+1)*shard_size)]
                 #              for r in range(data_parallel_world_size)] \
                 #                  if err_buf is not None else None
-                ref_buf_views = [ref_buf[(r*shard_size):((r+1)*shard_size)]
-                             for r in range(data_parallel_world_size)] \
-                                 if ref_buf is not None else None
+                if ref_buf is not None:
+                    ref_buf = ref_buf.data
+                    ref_buf_views = [ref_buf[(r*shard_size):((r+1)*shard_size)]
+                                for r in range(data_parallel_world_size)] 
+                else: ref_buf_views = None
                 view_items.append((model_index, dtype, 
                                    buf, buf_views,
                                    err_buf,
@@ -183,7 +186,7 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
             if use_error_feedback:
                 local_var.copy_(compressed_tensor).div_(-self.lowbit_scale/data_parallel_world_size)
                 local_var.add_(gbuf)
-                err_buf.add_(local_var, 1.-self.error_beta)
+                err_buf.add_(local_var, alpha=1.-self.error_beta)
             shard_size = int(gbuf.numel() / data_parallel_world_size)
             r = data_parallel_rank
             compressed_tensor_views = compressed_tensor[(r*shard_size):((r+1)*shard_size)]
@@ -222,7 +225,7 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
 
     @torch.no_grad()
     def step(self, args, timers):
-        update_flag, grad_norm, num_zeros_in_grad = super().step(self, args, timers)
+        update_flag, grad_norm, num_zeros_in_grad = super().step(args, timers)
         if self.pre_loss_scale != self.grad_scaler.scale:
             scale_change = self.grad_scaler.scale/self.pre_loss_scale
             for model_index, model in enumerate(self.models):
