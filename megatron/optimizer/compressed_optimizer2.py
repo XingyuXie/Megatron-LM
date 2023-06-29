@@ -87,28 +87,28 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
                 buf = mem_buffer.data
                 assert buf.numel() % data_parallel_world_size == 0
                 lowbit_grad_buf = model._lowbit_grad_buffers.get(dtype)
-                ref_buf = model._local_ref_points.get(dtype)
+                # ref_buf = model._local_ref_points.get(dtype)
                 
                 shard_size = int(buf.numel() / data_parallel_world_size)
                 buf_views = [buf[(r*shard_size):((r+1)*shard_size)]
                              for r in range(data_parallel_world_size)]
                 
                 if lowbit_grad_buf is not None:
-                    ref_buf = ref_buf.data
+                    # ref_buf = ref_buf.data
                     lowbit_grad_buf = lowbit_grad_buf.data
-                    ref_buf_views = [ref_buf[(r*shard_size):((r+1)*shard_size)]
-                             for r in range(data_parallel_world_size)]
+                    # ref_buf_views = [ref_buf[(r*shard_size):((r+1)*shard_size)]
+                    #          for r in range(data_parallel_world_size)]
                     lowbit_grad_buf_views = [lowbit_grad_buf[(r*shard_size):((r+1)*shard_size)]
                              for r in range(data_parallel_world_size)]
                     view_items.append((model_index, dtype, 
                                        buf, buf_views,
-                                       ref_buf,ref_buf_views,
+                                    #    ref_buf,ref_buf_views,
                                        lowbit_grad_buf,lowbit_grad_buf_views,
                                        model.lowbit_scale, model.ref_lr))
                 else:
                     view_items.append((model_index, dtype, 
                                     buf, buf_views,
-                                    None, None,
+                                    # None, None,
                                     None, None,
                                     None, None))
         return view_items
@@ -126,18 +126,22 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
         distributed optimizer, which reduces: 1) layernorm grads, 2) all
         grads, 3) embedding grads.
         """
-        
+         # Reduce-scatter setup.
+        timers('grads-reduce-scatter', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
+        data_parallel_rank = mpu.get_data_parallel_rank()
         data_parallel_world_size = mpu.get_data_parallel_world_size()
+        data_parallel_group = mpu.get_data_parallel_group()
         # # Scale grad buffers by '1 / data_parallel_world_size'.
         # for model in self.models:
         #     for dtype, gbuf in model._grad_buffers.items():
         #         gbuf.data /= data_parallel_world_size
-                
+               
         # Reduce-scatter all grads.
         gbuf_view_items = self.get_lowbit_buffer_dp_views()
         for index, (model_index, dtype,
                     gbuf, gbuf_views,
-                    ref_buf, ref_buf_views,
+                    # ref_buf, ref_buf_views,
                     lowbit_grad_buf, lowbit_grad_buf_views,
                     lowbit_scale, ref_lr) \
             in enumerate(gbuf_view_items):
@@ -148,8 +152,8 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
                     group = data_parallel_group,
                 )
                 continue
-            shard_size = int(gbuf.numel() / data_parallel_world_size)
-            local_ref = ref_buf.to(torch.cuda.current_device(), non_blocking=True)
+            # shard_size = int(gbuf.numel() / data_parallel_world_size)
+            # local_ref = ref_buf.to(torch.cuda.current_device(), non_blocking=True)
             compressed_tensor_views = lowbit_grad_buf_views[data_parallel_rank]
             
             torch.distributed.reduce_scatter_tensor(
@@ -157,17 +161,19 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
                 lowbit_grad_buf,
                 group = data_parallel_group,
             )
-            gbuf_views[data_parallel_rank].\
+            gbuf_views[data_parallel_rank-1].\
                 copy_(compressed_tensor_views).div_(lowbit_scale)
+            gbuf_views[data_parallel_rank].\
+                add_(gbuf_views[data_parallel_rank-1])
 
             # update refer point
             # print_rank_0('now {}; ref dtype {}; gbuf dtype {}'.
             #              format(dtype, ref_buf.dtype, gbuf.dtype))
-            local_ref.add_(gbuf)
-            local_view = local_ref[(data_parallel_rank*shard_size):\
-                ((data_parallel_rank+1)*shard_size)]
-            gbuf_views[data_parallel_rank].copy_(local_view)
-            ref_buf.copy_(local_ref.to("cpu", non_blocking=True))
+            # local_ref.add_(gbuf)
+            # local_view = local_ref[(data_parallel_rank*shard_size):\
+            #     ((data_parallel_rank+1)*shard_size)]
+            # gbuf_views[data_parallel_rank].copy_(local_view)
+            # ref_buf.copy_(local_ref.to("cpu", non_blocking=True))
 
             # # update the scatter part
             # ref_buf_views[data_parallel_rank].div_(1.0+ref_lr)
@@ -184,6 +190,8 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
         #     torch._foreach_zero_(model.ref_point_list)
         #     torch._foreach_add_(model.ref_point_list, model.main_grad_list)
         
+        timers('grads-reduce-scatter').stop()
+        
         # All-reduce layer-norm grads (for sequence parallelism).
         timers('layernorm-grads-all-reduce', log_level=1).start(
             barrier=args.barrier_with_L1_time)
@@ -195,15 +203,7 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
             barrier=args.barrier_with_L1_time)
         self.allreduce_embedding_grads(args)
         timers('embedding-grads-all-reduce').stop()
-
-        # Reduce-scatter setup.
-        timers('grads-reduce-scatter', log_level=1).start(
-            barrier=args.barrier_with_L1_time)
-        data_parallel_rank = mpu.get_data_parallel_rank()
-        data_parallel_world_size = mpu.get_data_parallel_world_size()
-        data_parallel_group = mpu.get_data_parallel_group()
-                 
-        timers('grads-reduce-scatter').stop()
+        
         # print_rank_0('done with grad reduce. Compilation time: {:.3f} seconds; grad compression is {}'
         #       .format(time.time() - start_time, self.grad_compression))
 

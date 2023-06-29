@@ -964,6 +964,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     assert param_range.size == shard_main_param.nelement()
 
                     model_grad = model_param.main_grad
+                    # if hasattr(model_param, "local_ref"):
+                    #     local_ref = model_param.local_ref.to(model_param.main_grad, non_blocking=True)
+                    #     model_grad.add_(local_ref)
+                    #     # print_rank_0("local ref add back")
                     shard_model_grad = model_grad.view(-1) \
                         [param_range.start:param_range.end]
                     shard_main_param.grad = shard_model_grad.float()
