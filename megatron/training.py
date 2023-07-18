@@ -504,6 +504,7 @@ def train_step(forward_step_func, data_iterator,
 
     if hasattr(model, '_before_opt_step'):
         model._before_opt_step = False
+        model.reset_reverse_param_iter()
         
     return {}, skipped_iter, grad_norm, num_zeros_in_grad
 

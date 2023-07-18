@@ -12,6 +12,8 @@ from megatron.core import mpu
 from .module import MegatronModule
 import time
 
+from typing import Dict
+
 
 class MemoryBuffer:
 
@@ -215,6 +217,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
             # Accumalation function for the gradients. We need
             # to store them so they don't go out of scope.
             self.grad_accs = []
+            self.used_param = []
             # Loop over all the parameters in the model.
             for param in self.module.parameters():
                 if param.requires_grad:
@@ -224,7 +227,31 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     grad_acc = param_tmp.grad_fn.next_functions[0][0]
                     grad_acc.register_hook(self._make_param_hook(param))
                     self.grad_accs.append(grad_acc)
+                    self.used_param.append(param)
 
+            ## prefetch part
+            self.element_thd = sum(type_num_elements.values())*0.5
+            self.reset_reverse_param_iter()
+            
+
+    ## prefetch part
+    def reset_reverse_param_iter(self):
+        self.reverse_param_iter = reversed(self.used_param)
+        self.prefetch_var: Dict[torch.nn.parameter.Parameter, torch.tensor] = {}
+        self.skip_param = set()
+        self.current_param_num = 0.0
+
+    ## prefetch part        
+    def prefetch_local_param(self):
+        if self.current_param_num > self.element_thd: return
+        for param in self.reverse_param_iter:
+            if not (param in self.skip_param):
+                self.prefetch_var[param] = (
+                    param.local_ref.to(param.main_grad, non_blocking=True),
+                    param.local_error.to(param.main_grad, non_blocking=True)
+                )
+                self.current_param_num += param.data.nelement()
+            if self.current_param_num > self.element_thd: break
 
     def _make_param_hook(self, param):
         """Create the all-reduce hook for backprop."""
@@ -247,8 +274,15 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     
                     # param.local_ref.add_(param.main_grad,  alpha=self.ref_lr/(1.0+self.ref_lr))
                     # param.local_ref.add_(local_var,  alpha=-1.+self.error_beta)
-                    local_ref = param.local_ref.to(param.main_grad, non_blocking=True)
-                    local_error = param.local_error.to(param.main_grad, non_blocking=True)
+                    if param in self.prefetch_var:
+                        print("Use prefetch_var!!!")
+                        local_ref = self.prefetch_var[param][0]
+                        local_error = self.prefetch_var[param][1]
+                    else:
+                        # print("No prefetch_var!!!")
+                        local_ref = param.local_ref.to(param.main_grad, non_blocking=True)
+                        local_error = param.local_error.to(param.main_grad, non_blocking=True)
+                        self.skip_param.add(param)
                     data_parallel_world_size = mpu.get_data_parallel_world_size()
                     param.main_grad.add_(local_ref, alpha=-self.ref_lr)
                     param.grad.copy_(param.main_grad)
@@ -261,9 +295,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     local_var.copy_(compressed_tensor).div_(-self.lowbit_scale/data_parallel_world_size)
                     local_var.add_(param.main_grad)
                     local_error.add_(local_var, alpha=1.-self.error_beta)
-                    
-                    
-                    
+            
                     # update ref
                     local_ref.add_(param.main_grad, alpha=1.-self.error_beta)
                     local_ref.div_(1+self.ref_lr)
@@ -275,6 +307,10 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     compressed_tensor=None
                     local_error = None
                     local_ref = None
+                    if param in self.prefetch_var:
+                        del self.prefetch_var[param]
+                        self.current_param_num -= param.data.nelement()
+                        self.prefetch_local_param()
                     
                 # Now we can deallocate grad memory.
                 param.grad = None

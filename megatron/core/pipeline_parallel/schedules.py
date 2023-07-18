@@ -367,6 +367,8 @@ def forward_backward_no_pipelining(*,
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
     with no_sync_func():
+        if hasattr(model, 'prefetch_local_param'):
+            model.prefetch_local_param()
         for i in range(num_microbatches - 1):
             output_tensor = forward_step(forward_step_func, data_iterator,
                                          model, num_microbatches, input_tensor, forward_data_store,
