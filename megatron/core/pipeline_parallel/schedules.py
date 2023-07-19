@@ -367,8 +367,6 @@ def forward_backward_no_pipelining(*,
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
     with no_sync_func():
-        if hasattr(model, 'prefetch_local_param'):
-            model.prefetch_local_param()
         for i in range(num_microbatches - 1):
             output_tensor = forward_step(forward_step_func, data_iterator,
                                          model, num_microbatches, input_tensor, forward_data_store,
@@ -379,6 +377,8 @@ def forward_backward_no_pipelining(*,
                   
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
+    if hasattr(model, 'prefetch_local_param'):
+            model.prefetch_local_param()
     if hasattr(model, '_before_opt_step'):
         model._before_opt_step = True
     output_tensor = forward_step(forward_step_func, data_iterator,

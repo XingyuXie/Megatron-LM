@@ -151,8 +151,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     type_num_elements[dtype] = type_num_elements.get(dtype, 0) \
                                                + param.data.nelement()
 
-            ## prefetch part
-            self.element_thd = sum(type_num_elements.values())*0.2
+            
 
             # Allocate the buffer.
             for dtype, num_elements in type_num_elements.items():
@@ -235,6 +234,12 @@ class DistributedDataParallel(DistributedDataParallelBase):
             ## prefetch part
             # self.element_thd = sum(type_num_elements.values())*0.5
             self.reset_reverse_param_iter()
+            ## prefetch part
+            self.element_thd = sum(
+                [param.data.nelement() \
+                 for param in self.module.parameters() \
+                    if param.requires_grad]
+            )*0.2
             
 
     ## prefetch part
@@ -243,20 +248,26 @@ class DistributedDataParallel(DistributedDataParallelBase):
         self.prefetch_var: Dict[torch.nn.parameter.Parameter, torch.tensor] = {}
         self.skip_param = set()
         self.current_param_num = 0.0
+        print("Reset Prefetch", flush=True)
 
     ## prefetch part        
     def prefetch_local_param(self):
         # print("current_param_num: ", self.current_param_num)
-        if self.current_param_num > self.element_thd: return
-        for param in self.reverse_param_iter:
-            if not (param in self.skip_param):
-                self.prefetch_var[param] = (
-                    param.local_ref.to(param.main_grad, non_blocking=True),
-                    param.local_error.to(param.main_grad, non_blocking=True)
-                )
-                self.current_param_num += param.data.nelement()
-                print("Add Param!!!")
-            if self.current_param_num > self.element_thd: break
+        if self.current_param_num > self.element_thd: 
+            print("Full of Prefetch Memory: {}% !".format(self.current_param_num*20/self.element_thd), flush=True)
+            return
+        while self.current_param_num  <= self.element_thd:
+            try:
+                param = next(self.reverse_param_iter)
+                if not (param in self.skip_param):
+                    self.prefetch_var[param] = (
+                        param.local_ref.to(param.main_grad, non_blocking=True),
+                        param.local_error.to(param.main_grad, non_blocking=True)
+                    )
+                    self.current_param_num += param.data.nelement()
+                    print("Add Param: {}% !".format(self.current_param_num*20/self.element_thd), flush=True)
+            except StopIteration:
+                print("The Prefetch iterator is exhausted!", flush=True)
 
     def _make_param_hook(self, param):
         """Create the all-reduce hook for backprop."""
@@ -284,7 +295,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
                         local_ref = self.prefetch_var[param][0]
                         local_error = self.prefetch_var[param][1]
                     else:
-                        # print("No prefetch_var!!!")
+                        # print("No prefetch_var!", flush=True)
                         local_ref = param.local_ref.to(param.main_grad, non_blocking=True)
                         local_error = param.local_error.to(param.main_grad, non_blocking=True)
                         self.skip_param.add(param)
@@ -315,6 +326,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     if param in self.prefetch_var:
                         del self.prefetch_var[param]
                         self.current_param_num -= param.data.nelement()
+                        print("Continue Prefetch!", flush=True)
                         self.prefetch_local_param()
                     
                 # Now we can deallocate grad memory.
