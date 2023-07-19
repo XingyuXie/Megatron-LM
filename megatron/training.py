@@ -502,9 +502,9 @@ def train_step(forward_step_func, data_iterator,
             loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
         return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
 
-    if hasattr(model, '_before_opt_step'):
-        model._before_opt_step = False
-        model.reset_reverse_param_iter()
+    # if hasattr(model, '_before_opt_step'):
+    #     model._before_opt_step = False
+    #     model.reset_reverse_param_iter()
         
     return {}, skipped_iter, grad_norm, num_zeros_in_grad
 
