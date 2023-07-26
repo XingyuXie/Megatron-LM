@@ -5,6 +5,7 @@ from abc import abstractmethod
 import math
 
 import torch
+from contextlib import nullcontext
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from megatron import get_args
@@ -13,6 +14,59 @@ from .module import MegatronModule
 import time
 
 from typing import Dict
+
+from sortedcontainers import SortedDict
+
+class MemoryManager:
+    def __init__(self, gpu_memory, dtype):
+        self.memory = torch.zeros(gpu_memory,
+                                  dtype=dtype,
+                                  device=torch.cuda.current_device(),
+                                  requires_grad=False)
+        self.total_memory = gpu_memory
+        self.free_blocks = SortedDict({0: gpu_memory})
+
+    def allocate(self, shape):
+        size = shape.numel()
+        # 找到最合适的空闲内存块
+        suitable_blocks = {k: v for k, v in self.free_blocks.items() if v >= size}
+        if suitable_blocks:
+            # 选择第一个符合大小需求的内存块
+            start_idx, block_size = min(suitable_blocks.items(), key=lambda x: x[1])
+            end_idx = start_idx + size
+            
+            # 更新 free_blocks
+            if block_size > size:
+                self.free_blocks[start_idx + size] = block_size - size
+                
+            del self.free_blocks[start_idx]
+            
+            return True, self.memory[start_idx:end_idx].view(shape), start_idx
+        # print("Not enough memory available!")
+        return False, None, None
+
+    def free(self, start_idx, size):
+        # 释放内存
+        self.free_blocks[start_idx] = size
+
+        # 合并相邻或重叠的空闲内存块
+        keys = list(self.free_blocks.keys())
+        merged_blocks = SortedDict()
+        current_start, current_size = keys[0], self.free_blocks[keys[0]]
+
+        for key in keys[1:]:
+            if key <= current_start + current_size:
+                current_size = max(current_size, key + self.free_blocks[key] - current_start)
+            else:
+                merged_blocks[current_start] = current_size
+                current_start, current_size = key, self.free_blocks[key]
+
+        merged_blocks[current_start] = current_size
+        self.free_blocks = merged_blocks
+
+    def reset(self):
+        # 重置内存管理器，所有内存都处于空闲状态
+        self.free_blocks = SortedDict({0: self.total_memory})
 
 
 class MemoryBuffer:
@@ -135,6 +189,9 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 self._local_error_feedbacks = {}
                 self._local_ref_points = {}
                 self._lowbit_grad_buffers = {}
+                ## prefetch
+                self._ref_prefetch = {}
+                self._err_prefetch = {}
             self._grad_buffer_param_index_map = {}
             data_parallel_world_size = mpu.get_data_parallel_world_size()
 
@@ -178,13 +235,17 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     self._local_ref_points[dtype] = MemoryBuffer(num_elements,
                                                             num_elements_padded,
                                                             dtype, device=torch.device("cpu"))
-                    
+
+                    ## prefetch 
+                    num_elements = int(num_elements*0.2)
+                    self._err_prefetch[dtype] = MemoryManager(num_elements,
+                                                            dtype)
+                    self._ref_prefetch[dtype] = MemoryManager(num_elements,
+                                                            dtype)
 
 
             # Assume the back prop order is reverse the params order,
             # store the start index for the gradients.
-            # self.main_grad_list = []
-            # self.ref_point_list = []
             for param in self.module.parameters():
                 if param.requires_grad:
                     dtype = _get_buffer_type(param)
@@ -232,63 +293,47 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     # self.used_param.append(param)
 
             ## prefetch part
-            # self.element_thd = sum(type_num_elements.values())*0.5
-            # if torch.distributed.get_rank() == 0:
-            #     print("Init Reset Prefetch", flush=True)
             self.prefetch_stream = torch.cuda.Stream()
             self.reset_reverse_param_iter()
-            ## prefetch part
-            self.element_thd = sum(
-                [param.data.nelement() \
-                 for param in self.module.parameters() \
-                    if param.requires_grad]
-            )*0.2
             
 
     ## prefetch part
     def reset_reverse_param_iter(self):
         self.reverse_param_iter = reversed([param for param in self.module.parameters() if param.requires_grad])
         self.prefetch_var: Dict[torch.nn.parameter.Parameter, torch.tensor] = {}
-        self.skip_param = set()
-        self.current_param_num = 0.0
-        # if torch.distributed.get_rank() == 0:
-        #     print("Reset Prefetch", flush=True)
+        for dtype, mem in self._err_prefetch.items():
+            mem.reset()
+            self._ref_prefetch[dtype].reset()
 
+        self.skip_param = set()
+        self.last_prefetch_param = None
+        # self.current_param_num = 0.0
+
+    ## prefetch part
+    def prefetch_allocate(self, param):
+        dtype = torch.float if \
+            self.accumulate_allreduce_grads_in_fp32 else param.dtype
+        if not (param in self.skip_param):
+            flag, err_tensor, err_idx = self._err_prefetch[dtype].allocate(param.data.shape)
+            if not flag: 
+                self.last_prefetch_param = param
+                return False
+            _, ref_tensor, ref_idx = self._ref_prefetch[dtype].allocate(param.data.shape)
+        # try:
+            self.prefetch_var[param] = (
+                err_tensor.copy_(param.local_error, non_blocking=True),
+                ref_tensor.copy_(param.local_ref, non_blocking=True),
+                err_idx,
+                ref_idx
+            )
+        return True
     ## prefetch part        
-    def prefetch_local_param(self, flag=False):
-        # print("current_param_num: ", self.current_param_num)
-        if self.current_param_num > self.element_thd:
-            if not flag: return
-            try:
-                with torch.cuda.stream(self.prefetch_stream):
-                    for _ in range(2):
-                        param = next(self.reverse_param_iter)
-                        if not (param in self.skip_param):
-                            self.prefetch_var[param] = (
-                                param.local_ref.to(param.main_grad, non_blocking=True),
-                                param.local_error.to(param.main_grad, non_blocking=True)
-                            )
-                            self.current_param_num += param.data.nelement()
-                    # if torch.distributed.get_rank() == 0:
-                    #     print("Continue Prefetch: {}% !".format(self.current_param_num*20/self.element_thd), flush=True)
-            except StopIteration: 
-                # print("Finish Prefetch:!", flush=True)
-                pass
-            return
+    def prefetch_local_param(self):
         with torch.cuda.stream(self.prefetch_stream):
+            if self.last_prefetch_param is not None: 
+                if not self.prefetch_allocate(self.last_prefetch_param): return
             for param in self.reverse_param_iter:
-                # try:
-                if not (param in self.skip_param):
-                    self.prefetch_var[param] = (
-                        param.local_ref.to(param.main_grad, non_blocking=True),
-                        param.local_error.to(param.main_grad, non_blocking=True)
-                    )
-                    self.current_param_num += param.data.nelement()
-                    # if torch.distributed.get_rank() == 0:
-                    #     print("Add Param: {}% !".format(self.current_param_num*20/self.element_thd), flush=True)
-                    if self.current_param_num > self.element_thd: break
-            # except StopIteration:
-            #     print("The Prefetch iterator is exhausted!", flush=True)
+                 if not self.prefetch_allocate(param): break
 
     def _make_param_hook(self, param):
         """Create the all-reduce hook for backprop."""
@@ -316,7 +361,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
                         local_ref = self.prefetch_var[param][0]
                         local_error = self.prefetch_var[param][1]
                     else:
-                        print("No prefetch_var!", flush=True)
+                        # print("No prefetch_var!", flush=True)
                         local_ref = param.local_ref.to(param.main_grad, non_blocking=True)
                         local_error = param.local_error.to(param.main_grad, non_blocking=True)
                         self.skip_param.add(param)
@@ -338,19 +383,27 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     local_ref.div_(1+self.ref_lr)
                     # param.local_ref.add_(param.main_grad)
                     param.main_grad.copy_(local_ref)
-                    # with torch.cuda.stream(self.prefetch_stream):
-                    param.local_ref.copy_(local_ref, non_blocking=True)
-                    param.local_error.copy_(local_error, non_blocking=True)
+                    with torch.cuda.stream(self.prefetch_stream) if param in self.prefetch_var else nullcontext():
+                        param.local_ref.copy_(local_ref, non_blocking=True)
+                        param.local_error.copy_(local_error, non_blocking=True)
+                        if param in self.prefetch_var:
+                            dtype = torch.float if \
+                                        self.accumulate_allreduce_grads_in_fp32 else param.dtype
+                            self._err_prefetch[dtype].free(self.prefetch_var[param][2],param.data.nelement())
+                            self._ref_prefetch[dtype].free(self.prefetch_var[param][3],param.data.nelement())
+                            del self.prefetch_var[param]
+                            
+
                     # compressed_tensor=None
                     # local_error = None
                     # local_ref = None
-                    with torch.cuda.stream(self.prefetch_stream):
-                        if param in self.prefetch_var:
-                            del self.prefetch_var[param]
-                            self.current_param_num -= param.data.nelement()
-                            # if torch.distributed.get_rank() == 0:
-                            #     print("Continue Prefetch!", flush=True)
-                            self.prefetch_local_param(True)
+                    # with torch.cuda.stream(self.prefetch_stream):
+                    #     if param in self.prefetch_var:
+                    #         del self.prefetch_var[param]
+                    #         self.current_param_num -= param.data.nelement()
+                    #         # if torch.distributed.get_rank() == 0:
+                    #         #     print("Continue Prefetch!", flush=True)
+                    #         self.prefetch_local_param(True)
                     
                 # Now we can deallocate grad memory.
                 param.grad = None
