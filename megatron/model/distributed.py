@@ -17,6 +17,7 @@ from typing import Dict, Callable
 
 from sortedcontainers import SortedDict
 from megatron import get_timers
+from functools import partial
 
 class MemoryManager:
     def __init__(self, gpu_memory, dtype):
@@ -295,6 +296,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
 
             ## prefetch part
             self.prefetch_stream = torch.cuda.Stream()
+            self.stream_context = partial(torch.cuda.stream, stream=self.prefetch_stream)
             self.reset_reverse_param_iter()
             
 
@@ -312,33 +314,44 @@ class DistributedDataParallel(DistributedDataParallelBase):
 
     ## prefetch part
     def prefetch_allocate(self, param):
+        # stream = torch.cuda.Stream()
+        
+    
+    # with torch.cuda.stream(self.prefetch_stream):
         timers = get_timers()
-        with torch.cuda.stream(self.prefetch_stream):
-            dtype = torch.float if \
-                self.accumulate_allreduce_grads_in_fp32 else param.dtype
-            if not (param in self.skip_param):
-                flag, err_tensor, err_idx = self._err_prefetch[dtype].allocate(param.data.shape)
-                if not flag: 
-                    self.last_prefetch_param = param
-                    return False
-                _, ref_tensor, ref_idx = self._ref_prefetch[dtype].allocate(param.data.shape)
-            # try:
+        dtype = torch.float if \
+            self.accumulate_allreduce_grads_in_fp32 else param.dtype
+        if not (param in self.skip_param):
+            # flag, err_tensor, err_idx = self._err_prefetch[dtype].allocate(param.data.shape)
+            # if not flag: 
+            #     self.last_prefetch_param = param
+            #     return False
+            # _, ref_tensor, ref_idx = self._ref_prefetch[dtype].allocate(param.data.shape)
+            err_tensor = torch.empty_like(param.local_error, device='cuda')
+            ref_tensor = torch.empty_like(param.local_ref, device='cuda')
+        # try:
+            with self.stream_context():
+                # self.prefetch_stream.wait_stream(torch.cuda.current_stream())
                 timers('prefetch-load-CPU2GPU', log_level=2).start()
                 err_tensor.copy_(param.local_error, non_blocking=True)
                 ref_tensor.copy_(param.local_ref, non_blocking=True)
                 timers('prefetch-load-CPU2GPU').stop()
-                self.prefetch_var[param] = (
-                    err_tensor,
-                    ref_tensor,
-                    err_idx,
-                    ref_idx
-                )
-            return True
+            
+            # ref_tensor.record_stream(torch.cuda.current_stream())
+            # err_tensor.record_stream(torch.cuda.current_stream())
+            self.prefetch_var[param] = (
+                err_tensor,
+                ref_tensor#,
+                # err_idx,
+                # ref_idx
+            )
+        return True
     ## prefetch part        
     def prefetch_local_param(self):
         if self.last_prefetch_param is not None: 
             if not self.prefetch_allocate(self.last_prefetch_param): return
         try:
+            # for _ in range(3):
             param = next(self.reverse_param_iter)
             self.prefetch_allocate(param)
         except StopIteration:
@@ -377,9 +390,12 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     # param.local_ref.add_(local_var,  alpha=-1.+self.error_beta)
                     if param in self.prefetch_var:
                         # print("Use prefetch_var!!!", flush=True)
+                        self.prefetch_var[param][0].record_stream(torch.cuda.current_stream())
+                        self.prefetch_var[param][1].record_stream(torch.cuda.current_stream())
                         local_ref = self.prefetch_var[param][0]
                         local_error = self.prefetch_var[param][1]
-                        torch.cuda.current_stream().wait_stream(self.prefetch_stream)
+
+                        # torch.cuda.current_stream().wait_stream(self.prefetch_stream)
                     else:
                         # print("No prefetch_var!", flush=True)
                         # timers('prefetch-load-CPU2GPU', log_level=2).start()
@@ -418,19 +434,19 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     # timers('prefetch-load-CPU2GPU', log_level=2).start()
                     param.main_grad.copy_(local_ref, non_blocking=True)
                     # timers('prefetch-load-CPU2GPU').stop()
-                    with torch.cuda.stream(self.prefetch_stream) if param in self.prefetch_var else nullcontext():
-                        timers = get_timers()
+                    # with torch.cuda.stream(self.prefetch_stream) if param in self.prefetch_var else nullcontext():
+                    with self.stream_context():
                         timers('prefetch-load-GPU2CPU', log_level=2).start()
                         param.local_ref.copy_(local_ref, non_blocking=True)
                         param.local_error.copy_(local_error, non_blocking=True)
                         timers('prefetch-load-GPU2CPU').stop()
-                        if param in self.prefetch_var:
-                            dtype = torch.float if \
-                                        self.accumulate_allreduce_grads_in_fp32 else param.dtype
-                            self._err_prefetch[dtype].free(self.prefetch_var[param][2],param.data.nelement())
-                            self._ref_prefetch[dtype].free(self.prefetch_var[param][3],param.data.nelement())
-                            del self.prefetch_var[param]
-                        self.prefetch_local_param()
+                    if param in self.prefetch_var:
+                        # dtype = torch.float if \
+                        #             self.accumulate_allreduce_grads_in_fp32 else param.dtype
+                        # self._err_prefetch[dtype].free(self.prefetch_var[param][2],param.data.nelement())
+                        # self._ref_prefetch[dtype].free(self.prefetch_var[param][3],param.data.nelement())
+                        del self.prefetch_var[param]
+                    self.prefetch_local_param()
                             
 
                     # compressed_tensor=None
