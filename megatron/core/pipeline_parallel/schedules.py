@@ -366,11 +366,13 @@ def forward_backward_no_pipelining(*,
 
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
+
+    if hasattr(model, '_before_opt_step') and not forward_only:
+        # timers('prefetch-load', log_level=2).start()
+        model.prefetch_local_param()
+        # timers('prefetch-load').stop()
+
     with no_sync_func():
-        if hasattr(model, '_before_opt_step') and not forward_only:
-            timers('prefetch-load', log_level=2).start()
-            model.prefetch_local_param()
-            timers('prefetch-load').stop()
         for i in range(num_microbatches - 1):
             output_tensor = forward_step(forward_step_func, data_iterator,
                                          model, num_microbatches, input_tensor, forward_data_store,

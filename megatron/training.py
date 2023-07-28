@@ -549,7 +549,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     # Logging.
     timers_to_log = [
         'forward-backward',
-        'prefetch-load',
+        'prefetch-load-CPU2GPU',
+        'prefetch-load-GPU2CPU',
         'forward-compute',
         'backward-compute',
         'batch-generator',
