@@ -886,6 +886,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         timers('params-all-gather', log_level=1).start(
             barrier=args.barrier_with_L1_time)
+        #torch.cuda.nvtx.range_push("params-all-gather'")
 
         data_parallel_rank = mpu.get_data_parallel_rank()
         data_parallel_group = mpu.get_data_parallel_group()
@@ -913,7 +914,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     param_buf = self.param_buffers[model_id][dtype]
                     param_buf_shard = param_buf[buf_start:buf_end]
                     param.view(-1).detach().copy_(param_buf_shard)
-
+        #torch.cuda.nvtx.range_pop()
         timers('params-all-gather').stop()
 
 

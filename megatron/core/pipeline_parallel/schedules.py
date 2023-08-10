@@ -367,10 +367,10 @@ def forward_backward_no_pipelining(*,
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
 
-    # if hasattr(model, '_before_opt_step') and not forward_only:
-    #     # timers('prefetch-load', log_level=2).start()
-    #     model.prefetch_local_param()
-    #     # timers('prefetch-load').stop()
+    if hasattr(model, '_before_opt_step') and not forward_only and not model.param_order.first_pass:
+         # timers('prefetch-load', log_level=2).start()
+         model.prefetch_param_hook_gpu_tensor(model.param_order.first_param)
+         # timers('prefetch-load').stop()
 
     with no_sync_func():
         for i in range(num_microbatches - 1):

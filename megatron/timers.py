@@ -35,13 +35,15 @@ class TimerBase(ABC):
 
 class DummyTimer(TimerBase):
 
-    def __init__(self):
-        super().__init__('dummy timer')
+    def __init__(self, name):
+        super().__init__(name)
 
     def start(self, barrier=False):
+        torch.cuda.nvtx.range_push(self.name)
         return
 
     def stop(self, barrier=False):
+        torch.cuda.nvtx.range_pop()
         return
 
     def reset(self):
@@ -83,7 +85,8 @@ class Timer(TimerBase):
             torch.distributed.barrier(group=self._barrier_group)
         torch.cuda.synchronize()
         self._start_time = time.time()
-        self._started = True
+        self._started = True     
+        
 
 
     def stop(self, barrier=False):
@@ -128,7 +131,7 @@ class Timers:
         self._log_option = log_option
         self._timers = {}
         self._log_levels = {}
-        self._dummy_timer = DummyTimer()
+#        self._dummy_timer = DummyTimer()
         self._max_log_level = 2
 
 
@@ -152,7 +155,7 @@ class Timers:
         # Now if the input log level is larger than the one set for
         # the timers class, just ignore it and return a dummy timer.
         if log_level > self._log_level:
-            return self._dummy_timer
+            return DummyTimer(name)#self._dummy_timer
         # Otherwise, initalize the timer and set the level.
         self._timers[name] = Timer(name)
         self._log_levels[name] = log_level

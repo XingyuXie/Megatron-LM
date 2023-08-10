@@ -94,6 +94,7 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
                              for r in range(data_parallel_world_size)]
                 
                 if lowbit_grad_buf is not None:
+                    # torch.cuda.current_stream().wait_stream(model._hook_stream)
                     # ref_buf = ref_buf.data
                     lowbit_grad_buf = lowbit_grad_buf.data
                     # ref_buf_views = [ref_buf[(r*shard_size):((r+1)*shard_size)]
@@ -129,6 +130,7 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
          # Reduce-scatter setup.
         timers('grads-reduce-scatter', log_level=1).start(
             barrier=args.barrier_with_L1_time)
+        # torch.cuda.nvtx.range_push("grads-reduce-scatter")
         data_parallel_rank = mpu.get_data_parallel_rank()
         data_parallel_world_size = mpu.get_data_parallel_world_size()
         data_parallel_group = mpu.get_data_parallel_group()
@@ -189,7 +191,7 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
         #     torch._foreach_add_(model.main_grad_list, model.ref_point_list)
         #     torch._foreach_zero_(model.ref_point_list)
         #     torch._foreach_add_(model.ref_point_list, model.main_grad_list)
-        
+        #torch.cuda.nvtx.range_pop()
         timers('grads-reduce-scatter').stop()
         
         # All-reduce layer-norm grads (for sequence parallelism).
