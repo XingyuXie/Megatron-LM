@@ -20,7 +20,57 @@ from megatron import get_timers
 from functools import partial
 
 
+import heapq
+
 class ParamScheduler:
+    def __init__(self):
+        self.params = []
+        self.timestamp = 0
+        self.first_pass = True
+        self.param_index = {}  # 用于保存每个param的时间戳
+        self.sorted_params_cache = {}  # 为每个param保存排序后的参数列表
+        self.first_param = None
+
+    def add_param(self, param):
+        if self.first_pass:
+            size = param.data.nelement()
+            self.params.append((param, size, self.timestamp))
+            self.param_index[param] = self.timestamp
+            self.timestamp += 1
+            if len(self.params)==1: self.first_param = param 
+
+    def _get_sorted_params_after(self, current_param):
+        current_timestamp = self.param_index.get(current_param)
+        if current_timestamp is None:
+            raise ValueError("The current_param is not found in the added parameters.")
+        
+        valid_params = [(-size, timestamp, param) for param, size, timestamp in self.params if timestamp > current_timestamp]
+        heapq.heapify(valid_params)  # Convert valid_params into a valid heap
+    
+        return valid_params
+
+
+    def get_next_params(self, current_param, n=1):
+        # 使用列表的copy方法来复制缓存中的列表
+        sorted_params = self.sorted_params_cache.get(current_param, []).copy()
+        
+        # 获取最大的n个元素
+        largest_n_params = [heapq.heappop(sorted_params)[2] for _ in range(min(n, len(sorted_params)))]
+    
+        # 由于我们是从复制的列表中提取数据，因此不需要更新缓存
+        return largest_n_params
+
+
+    def finish_first_pass(self):
+        for param, _, timestamp in self.params:
+            self.sorted_params_cache[param] = self._get_sorted_params_after(param)
+        self.first_pass = False
+
+
+
+
+
+class ParamScheduler_old:
     def __init__(self):
         self.param_order = {}
         self.last_param = None
@@ -283,7 +333,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
                                                             dtype, device=torch.device("cpu"))
 
                     ## prefetch 
-                    num_elements = int(num_elements*0.25)
+                    num_elements = int(num_elements*0.2)
                     self._err_prefetch[dtype] = MemoryManager(num_elements,
                                                             dtype)
                     self._ref_prefetch[dtype] = MemoryManager(num_elements,
@@ -383,9 +433,9 @@ class DistributedDataParallel(DistributedDataParallelBase):
         
     def prefetch_param_hook_gpu_tensor(self, param, skip_first = False):
         if not skip_first and not self.param_hook_gpu_tensor(param): return
-        param_load = self.param_order.get_next_params(param)
-        while len(param_load)>0 and self.param_hook_gpu_tensor(param_load[0]):
-            param_load = self.param_order.get_next_params(param_load)
+        param_loads = self.param_order.get_next_params(param)
+        for param_load in param_loads:
+            if not self.param_hook_gpu_tensor(param_load): return
 
      
     def _make_param_hook(self, param):
@@ -396,7 +446,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
             if param.grad is not None:
                 # The gradient function of linear layers is fused with GEMMs
                 param.main_grad.add_(param.grad.data)
-                self.param_order.add_param(param)
+                if param not in self.skip_param: self.param_order.add_param(param)
                 if self._before_opt_step and hasattr(param, 'local_error') and not self.param_order.first_pass:
                     timers = get_timers()
                     if getattr(param, 'local_error_gpu_test', None) is not None:
@@ -413,6 +463,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
                         local_ref = param.local_ref_gpu
                         local_error = param.local_error_gpu
                     data_parallel_world_size = mpu.get_data_parallel_world_size()
+                    ## wait io stream
                     torch.cuda.current_stream().wait_stream(self._param_stream[param])
 
                     torch.cuda.nvtx.range_push("Err-FeedBack&Ref-Point")
@@ -447,9 +498,10 @@ class DistributedDataParallel(DistributedDataParallelBase):
                                         self.accumulate_allreduce_grads_in_fp32 else param.dtype
                         self._err_prefetch[dtype].free(param.err_idx, param.data.nelement())
                         self._ref_prefetch[dtype].free(param.ref_idx, param.data.nelement())
+                        self.prefetch_param_hook_gpu_tensor(param, skip_first=True)
                     param.local_ref_gpu = None
                     param.local_error_gpu = None
-                    self.prefetch_param_hook_gpu_tensor(param, skip_first=True)
+                    
                     
                 # Now we can deallocate grad memory.
                 param.grad = None
