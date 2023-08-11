@@ -65,9 +65,9 @@ def tree_reduce_scatter(x, group_level=None, op=ReduceOp.SUM, async_op=False):
         else:
             tensor_views = x[group_range[my_rank][0] + half_size:group_range[my_rank][1]]
             group_range[my_rank][0] = group_range[my_rank][0] + half_size
-        print('Rank {}, Group Rank {}, '
-              'Level {}: Before reduce on group {} -> {}'.format(dist.get_rank(), sub_group.rank(),
-                                                                 level, sub_group_ranks, x))
+#        print('Rank {}, Group Rank {}, '
+#              'Level {}: Before reduce on group {} -> {}'.format(dist.get_rank(), sub_group.rank(),
+#                                                                 level, sub_group_ranks, x))
         dist.reduce_scatter_tensor(
             tensor_views,
             tensor,
@@ -75,9 +75,9 @@ def tree_reduce_scatter(x, group_level=None, op=ReduceOp.SUM, async_op=False):
             async_op=False if level != num_levels - 1 else async_op,
             group=sub_group
         )
-        print('Rank {}, Group Rank {}, '
-              'Level {}: After reduce on group {} -> {}'.format(dist.get_rank(), sub_group.rank(),
-                                                                level, sub_group_ranks, x))
+#        print('Rank {}, Group Rank {}, '
+#              'Level {}: After reduce on group {} -> {}'.format(dist.get_rank(), sub_group.rank(),
+#                                                                level, sub_group_ranks, x))
     return x
 
 

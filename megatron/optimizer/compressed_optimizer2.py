@@ -133,12 +133,12 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
         timers('grads-reduce-scatter', log_level=1).start(
             barrier=args.barrier_with_L1_time)
         # torch.cuda.nvtx.range_push("grads-reduce-scatter")
-        # data_parallel_rank = mpu.get_data_parallel_rank()
-        # data_parallel_world_size = mpu.get_data_parallel_world_size()
+        data_parallel_rank = mpu.get_data_parallel_rank()
+        data_parallel_world_size = mpu.get_data_parallel_world_size()
         # data_parallel_group = mpu.get_data_parallel_group()
 
-        data_parallel_rank = mpu.get_data_parallel_rank_tree()
-        data_parallel_world_size = mpu.get_data_parallel_world_size_tree()
+        # data_parallel_rank = mpu.get_data_parallel_rank_tree()
+        # data_parallel_world_size = mpu.get_data_parallel_world_size_tree()
         data_parallel_group = mpu.get_data_parallel_group_tree()
 
 
@@ -163,7 +163,7 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
                 # )
                 tree_reduce_scatter(
                     gbuf.div_(data_parallel_world_size),
-                    group = data_parallel_group,
+                    group_level = data_parallel_group,
                 )
                 continue
             # shard_size = int(gbuf.numel() / data_parallel_world_size)
@@ -177,7 +177,7 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
             # )
             tree_reduce_scatter(
                 lowbit_grad_buf,
-                group = data_parallel_group,
+                group_level = data_parallel_group,
             )
             gbuf_views[data_parallel_rank-1].\
                 copy_(compressed_tensor_views).div_(lowbit_scale)
