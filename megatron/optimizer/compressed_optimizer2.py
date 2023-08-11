@@ -11,6 +11,8 @@ import time
 from megatron import print_rank_0
 from megatron.core import mpu, tensor_parallel
 
+from ..tree import tree_reduce_scatter
+
 from .optimizer import _zero_grad_group_helper
 from .distrib_optimizer import DistributedOptimizer
 
@@ -131,9 +133,15 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
         timers('grads-reduce-scatter', log_level=1).start(
             barrier=args.barrier_with_L1_time)
         # torch.cuda.nvtx.range_push("grads-reduce-scatter")
-        data_parallel_rank = mpu.get_data_parallel_rank()
-        data_parallel_world_size = mpu.get_data_parallel_world_size()
-        data_parallel_group = mpu.get_data_parallel_group()
+        # data_parallel_rank = mpu.get_data_parallel_rank()
+        # data_parallel_world_size = mpu.get_data_parallel_world_size()
+        # data_parallel_group = mpu.get_data_parallel_group()
+
+        data_parallel_rank = mpu.get_data_parallel_rank_tree()
+        data_parallel_world_size = mpu.get_data_parallel_world_size_tree()
+        data_parallel_group = mpu.get_data_parallel_group_tree()
+
+
         # # Scale grad buffers by '1 / data_parallel_world_size'.
         # for model in self.models:
         #     for dtype, gbuf in model._grad_buffers.items():
@@ -148,8 +156,12 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
                     lowbit_scale, ref_lr) \
             in enumerate(gbuf_view_items):
             if lowbit_grad_buf is None:
-                torch.distributed.reduce_scatter_tensor(
-                    gbuf_views[data_parallel_rank],
+                # torch.distributed.reduce_scatter_tensor(
+                #     gbuf_views[data_parallel_rank],
+                #     gbuf.div_(data_parallel_world_size),
+                #     group = data_parallel_group,
+                # )
+                tree_reduce_scatter(
                     gbuf.div_(data_parallel_world_size),
                     group = data_parallel_group,
                 )
@@ -158,8 +170,12 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
             # local_ref = ref_buf.to(torch.cuda.current_device(), non_blocking=True)
             compressed_tensor_views = lowbit_grad_buf_views[data_parallel_rank]
             
-            torch.distributed.reduce_scatter_tensor(
-                compressed_tensor_views,
+            # torch.distributed.reduce_scatter_tensor(
+            #     compressed_tensor_views,
+            #     lowbit_grad_buf,
+            #     group = data_parallel_group,
+            # )
+            tree_reduce_scatter(
                 lowbit_grad_buf,
                 group = data_parallel_group,
             )

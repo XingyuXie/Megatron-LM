@@ -576,6 +576,15 @@ def get_data_parallel_world_size():
     """Return world size for the data parallel group."""
     return torch.distributed.get_world_size(group=get_data_parallel_group())
 
+def get_data_parallel_world_size_tree():
+    """Return world size for the data parallel tree group."""
+    return torch.distributed.get_world_size(group=get_data_parallel_group_tree())
+
+
+def get_data_parallel_rank_tree():
+    """Return my rank for the data parallel tree group."""
+    return torch.distributed.get_rank(group=get_data_parallel_group_tree())
+
 
 def get_data_parallel_rank():
     """Return my rank for the data parallel group."""
