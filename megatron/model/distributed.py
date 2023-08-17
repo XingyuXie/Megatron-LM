@@ -262,9 +262,9 @@ class DistributedDataParallel(DistributedDataParallelBase):
             self._local_error_feedbacks = None
             self._lowbit_grad_buffers = None
             self._local_ref_points = None
-            self.lowbit_scale = 32768.0
+            self.lowbit_scale = 262144.0
             self.lowbit_gap = 2048
-            self.error_beta = 0.95
+            self.error_beta = 0.9
             self.ref_lr = 1.0
             print("We will compresse grad to int8!!!")
         # If we are using fp32-accumulate-allreduce explicitly
@@ -327,17 +327,17 @@ class DistributedDataParallel(DistributedDataParallelBase):
                                                         torch.int8)
                     self._local_error_feedbacks[dtype] = MemoryBuffer(num_elements,
                                                             num_elements_padded,
-                                                            dtype, device=torch.device("cpu"))
+                                                            param.dtype, device=torch.device("cpu"))
                     self._local_ref_points[dtype] = MemoryBuffer(num_elements,
                                                             num_elements_padded,
-                                                            dtype, device=torch.device("cpu"))
+                                                            param.dtype, device=torch.device("cpu"))
 
                     ## prefetch 
                     num_elements = int(num_elements*0.2)
                     self._err_prefetch[dtype] = MemoryManager(num_elements,
-                                                            dtype)
+                                                            param.dtype)
                     self._ref_prefetch[dtype] = MemoryManager(num_elements,
-                                                            dtype)
+                                                            param.dtype)
 
 
             # Assume the back prop order is reverse the params order,
@@ -354,8 +354,8 @@ class DistributedDataParallel(DistributedDataParallelBase):
                         if torch.distributed.get_rank() == 0:
                             print("name is {}; Size is {};".format(param_name,param.data.nelement()), flush=True)
                         if 'word_embeddings.weigh' in param_name:
-                            param.local_error_gpu_test = torch.zeros_like(param, dtype=dtype)
-                            param.local_ref_gpu_test = torch.zeros_like(param, dtype=dtype)
+                            param.local_error_gpu_test = torch.zeros_like(param, dtype=param.dtype)
+                            param.local_ref_gpu_test = torch.zeros_like(param, dtype=param.dtype)
                             self.skip_param.add(param)
                         else:
                             param.local_error = \
@@ -437,7 +437,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
         for param_load in param_loads:
             if not self.param_hook_gpu_tensor(param_load): return
 
-     
+    @torch.no_grad()
     def _make_param_hook(self, param):
         """Create the all-reduce hook for backprop."""
         # Hook used for back-prop.
@@ -452,13 +452,17 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     if getattr(param, 'local_error_gpu_test', None) is not None:
                         local_ref = param.local_ref_gpu_test
                         local_error = param.local_error_gpu_test
+                        # if torch.distributed.get_rank() == 0:
+                        #     print("In GPU;", flush=True)
                     elif getattr(param, 'local_error_gpu', None) is None:
                         timers('prefetch-load-CPU2GPU-prefetch', log_level=2).start()
                         with torch.cuda.stream(self._param_stream[param]):#(self._cpu_to_gpu_stream):
-                            local_ref = param.local_ref.to(param.main_grad, non_blocking=True)
-                            local_error = param.local_error.to(param.main_grad, non_blocking=True)
+                            local_ref = torch.empty_like(param.main_grad, dtype=param.dtype)
+                            local_error = torch.empty_like(param.main_grad, dtype=param.dtype)
+                            local_ref.copy_(param.local_ref, non_blocking=True)
+                            local_error.copy_(param.local_error, non_blocking=True)
                         timers('prefetch-load-CPU2GPU-prefetch').stop()
-                                
+
                     else:                       
                         local_ref = param.local_ref_gpu
                         local_error = param.local_error_gpu
@@ -479,11 +483,19 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     local_var.copy_(compressed_tensor).div_(-self.lowbit_scale/data_parallel_world_size)
                     local_var.add_(local_main_grad)
                     local_error.add_(local_var, alpha=1.-self.error_beta)
-            
+
+                    
                     # update ref
                     local_ref.add_(local_main_grad, alpha=1.-self.error_beta) 
-                    local_ref.div_(1+self.ref_lr)
-                    param.main_grad.copy_(local_ref)
+                    # local_ref.div_(1+self.ref_lr)
+                    local_main_grad.copy_(local_ref)
+                    # local_ref.add_(local_main_grad, alpha=self.ref_lr) 
+                    # torch.abs(local_ref, out=local_var)
+                    # sign_var = local_ref.sign()
+                    # local_var.mul_(4).add_(self.ref_lr**2).sqrt_().add_(self.ref_lr).square_()
+                    # local_ref.mul_(2.0).div_(local_var).square_().mul_(sign_var)
+                    # local_main_grad.copy_(local_ref)
+
                     torch.cuda.nvtx.range_pop()
 
                     if getattr(param, 'local_error', None) is not None:

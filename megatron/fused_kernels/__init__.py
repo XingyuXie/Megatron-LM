@@ -28,11 +28,13 @@ def load(args):
             cc_flag.append('arch=compute_90,code=sm_90')
 
     # Build path
+    print('> Build path', flush=True)
     srcpath = pathlib.Path(__file__).parent.absolute()
     buildpath = srcpath / 'build'
     _create_build_dir(buildpath)
 
     # Helper function to build the kernels.
+    print('> Helper function to build the kernels.', flush=True)
     def _cpp_extention_load_helper(name, sources, extra_cuda_flags):
         return cpp_extension.load(
             name=name,
@@ -44,18 +46,21 @@ def load(args):
                                '--use_fast_math'] + extra_cuda_flags + cc_flag,
             verbose=(args.rank == 0)
         )
-
+    print('> done Helper function to build the kernels.', flush=True)
+    
     # ==============
     # Fused softmax.
     # ==============
-
+    
     if args.masked_softmax_fusion:
+        print('> Fused softmax.', flush=True)
         extra_cuda_flags = ['-U__CUDA_NO_HALF_OPERATORS__',
                             '-U__CUDA_NO_HALF_CONVERSIONS__',
                             '--expt-relaxed-constexpr',
                             '--expt-extended-lambda']
 
         # Upper triangular softmax.
+        print('> scaled_upper_triang_masked_softmax.', flush=True)
         sources=[srcpath / 'scaled_upper_triang_masked_softmax.cpp',
                  srcpath / 'scaled_upper_triang_masked_softmax_cuda.cu']
         scaled_upper_triang_masked_softmax_cuda = _cpp_extention_load_helper(
@@ -63,17 +68,20 @@ def load(args):
             sources, extra_cuda_flags)
 
         # Masked softmax.
+        print('> scaled_masked_softmax.', flush=True)
         sources=[srcpath / 'scaled_masked_softmax.cpp',
                  srcpath / 'scaled_masked_softmax_cuda.cu']
         scaled_masked_softmax_cuda = _cpp_extention_load_helper(
             "scaled_masked_softmax_cuda", sources, extra_cuda_flags)
 
         # Softmax
+        print('> scaled_softmax.', flush=True)
         sources=[srcpath / 'scaled_softmax.cpp',
                  srcpath / 'scaled_softmax_cuda.cu']
         scaled_softmax_cuda = _cpp_extention_load_helper(
             "scaled_softmax_cuda", sources, extra_cuda_flags)
-
+        
+        print('> done Fused softmax.', flush=True)
 
 def _get_cuda_bare_metal_version(cuda_dir):
     raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"],

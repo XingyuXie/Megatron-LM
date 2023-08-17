@@ -128,10 +128,13 @@ def _compile_dependencies():
         start_time = time.time()
         print('> compiling and loading fused kernels ...', flush=True)
         fused_kernels.load(args)
+        print('> done compiling and loading fused kernels', flush=True)
         torch.distributed.barrier()
     else:
         torch.distributed.barrier()
+        print('> compiling and loading fused kernels ...', flush=True)
         fused_kernels.load(args)
+        print('> done compiling and loading fused kernels', flush=True)
     # Simple barrier to make sure all ranks have passed the
     # compilation phase successfully before moving on to the
     # rest of the program. We think this might ensure that

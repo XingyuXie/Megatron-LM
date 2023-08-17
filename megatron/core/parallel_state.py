@@ -167,7 +167,7 @@ def initialize_model_parallel(
             all_data_parallel_group_ranks.append(list(ranks))
             group = torch.distributed.new_group(ranks)
             group_gloo = torch.distributed.new_group(ranks, backend="gloo")
-            group_tree = build_tree_group(ranks)
+            group_tree =  torch.distributed.new_group(ranks)#build_tree_group(ranks)
             if rank in ranks:
                 _DATA_PARALLEL_GROUP_TREE = group_tree
                 _DATA_PARALLEL_GROUP = group
