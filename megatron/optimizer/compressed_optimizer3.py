@@ -199,8 +199,13 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
                         # print(sum_low_bit, flush=True)
                     print("Rank{}: Max Value is {}; Min Value is {};".format(torch.distributed.get_rank(), max_value, min_value), flush=True)
                     self.low_bit_overflow.fill_(1.0)
-            gbuf_views[data_parallel_rank].\
-                copy_(local_ref.add_(sum_low_bit.div_(lowbit_scale)))
+            torch.distributed.all_reduce(self.low_bit_overflow,
+                                     op=torch.distributed.ReduceOp.MAX,
+                                     group=data_parallel_group
+                                    )
+            if  (self.low_bit_overflow.item() == 0):
+                gbuf_views[data_parallel_rank].\
+                    copy_(local_ref.add_(sum_low_bit.div_(lowbit_scale)))
         timers('grads-reduce-scatter').stop()
         
        
@@ -211,11 +216,8 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
     @torch.no_grad()
     def step(self, args, timers):
         # Update across all data parallel instances.
-        torch.distributed.all_reduce(self.low_bit_overflow,
-                                     op=torch.distributed.ReduceOp.MAX,
-                                     group=mpu.get_data_parallel_group())
         if  (self.low_bit_overflow.item() > 0):
-            self._copy_model_grads_to_main_grads()
+            # self._copy_model_grads_to_main_grads()
             self.low_bit_overflow.fill_(0.0)
             for model_index, model in enumerate(self.models):
                 model.lowbit_scale = max(model.lowbit_scale*0.5, 1.0)
@@ -225,8 +227,7 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
                     ref_buf.zero()
                     if torch.distributed.get_rank() == 0:
                         print("Rezero ref_buf", flush=True)
-                if torch.distributed.get_rank() == 0:
-                    print("Decay lowbit_scale to {};".format(model.lowbit_scale), flush=True)
+                        print("Decay lowbit_scale to {};".format(model.lowbit_scale), flush=True)
             return False, None, None
         else:
             self.low_bit_step_gap+=1.0

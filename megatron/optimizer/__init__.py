@@ -8,7 +8,7 @@ from .lowbithook import LowbitHook
 from megatron import get_args
 
 from .distrib_optimizer import DistributedOptimizer
-from .compressed_optimizer2 import CompressedDistributedOptimizer
+from .compressed_optimizer3 import CompressedDistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
 
