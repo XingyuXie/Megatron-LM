@@ -162,6 +162,10 @@ class MemoryManager:
     def reset(self):
         # 重置内存管理器，所有内存都处于空闲状态
         self.free_blocks = SortedDict({0: self.total_memory})
+    
+    def zero(self):
+        """Reset the buffer to zero."""
+        self.memory.zero_()
 
 
 class MemoryBuffer:
@@ -262,10 +266,10 @@ class DistributedDataParallel(DistributedDataParallelBase):
             self._local_error_feedbacks = None
             self._lowbit_grad_buffers = None
             self._local_ref_points = None
-            self.lowbit_scale = 262144.0
-            self.lowbit_gap = 2048
-            self.error_beta = 0.9
+            self.lowbit_scale = 262144.0/4
+            self.error_beta = 0.95
             self.ref_lr = 1.0
+            self.compressed_overflow = torch.cuda.FloatTensor([0.0])
             print("We will compresse grad to int8!!!")
         # If we are using fp32-accumulate-allreduce explicitly
         # this means we need main grads in a continous buffer.
@@ -288,6 +292,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 self._ref_prefetch = {}
                 self._err_prefetch = {}
                 self._param_stream = {}
+                self._error_norm = {}
             self._grad_buffer_param_index_map = {}
             data_parallel_world_size = mpu.get_data_parallel_world_size()
 
@@ -330,7 +335,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
                                                             param.dtype, device=torch.device("cpu"))
                     self._local_ref_points[dtype] = MemoryBuffer(num_elements,
                                                             num_elements_padded,
-                                                            param.dtype, device=torch.device("cpu"))
+                                                            param.dtype)#, #device=torch.device("cpu"))
 
                     ## prefetch 
                     num_elements = int(num_elements*0.2)
@@ -404,6 +409,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
         for dtype, mem in self._err_prefetch.items():
             mem.reset()
             self._ref_prefetch[dtype].reset()
+            self._error_norm[dtype] = (1e-8, 1e-8)
 
 
     def param_hook_gpu_tensor(self, param):
@@ -416,19 +422,19 @@ class DistributedDataParallel(DistributedDataParallelBase):
             flag, err_tensor, err_idx = self._err_prefetch[dtype].allocate(param.data.shape)
             # assert flag
             if not flag: return False
-            _, ref_tensor, ref_idx = self._ref_prefetch[dtype].allocate(param.data.shape)
+            # _, ref_tensor, ref_idx = self._ref_prefetch[dtype].allocate(param.data.shape)
             
             timers('prefetch-load-CPU2GPU-prefetch', log_level=2).start()
             with torch.cuda.stream(self._param_stream[param]):#(self._cpu_to_gpu_stream):
                 err_tensor.copy_(param.local_error, non_blocking=True)
-                ref_tensor.copy_(param.local_ref, non_blocking=True)
+                # ref_tensor.copy_(param.local_ref, non_blocking=True)
             # param.local_ref_gpu = param.local_ref.cuda(non_blocking=True)
             # param.local_error_gpu = param.local_error.cuda(non_blocking=True)
             timers('prefetch-load-CPU2GPU-prefetch').stop()
-            param.local_ref_gpu = ref_tensor
+            # param.local_ref_gpu = ref_tensor
             param.local_error_gpu = err_tensor
             param.err_idx = err_idx
-            param.ref_idx = ref_idx
+            # param.ref_idx = ref_idx
         return True
         
     def prefetch_param_hook_gpu_tensor(self, param, skip_first = False):
@@ -449,23 +455,26 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 if param not in self.skip_param: self.param_order.add_param(param)
                 if self._before_opt_step and hasattr(param, 'local_error') and not self.param_order.first_pass:
                     timers = get_timers()
+                    dtype = torch.float if \
+                        self.accumulate_allreduce_grads_in_fp32 else param.dtype
                     if getattr(param, 'local_error_gpu_test', None) is not None:
-                        local_ref = param.local_ref_gpu_test
+                        # local_ref = param.local_ref_gpu_test
                         local_error = param.local_error_gpu_test
                         # if torch.distributed.get_rank() == 0:
                         #     print("In GPU;", flush=True)
                     elif getattr(param, 'local_error_gpu', None) is None:
                         timers('prefetch-load-CPU2GPU-prefetch', log_level=2).start()
                         with torch.cuda.stream(self._param_stream[param]):#(self._cpu_to_gpu_stream):
-                            local_ref = torch.empty_like(param.main_grad, dtype=param.dtype)
+                            # local_ref = torch.empty_like(param.main_grad, dtype=param.dtype)
                             local_error = torch.empty_like(param.main_grad, dtype=param.dtype)
-                            local_ref.copy_(param.local_ref, non_blocking=True)
+                            # local_ref.copy_(param.local_ref, non_blocking=True)
                             local_error.copy_(param.local_error, non_blocking=True)
                         timers('prefetch-load-CPU2GPU-prefetch').stop()
 
                     else:                       
-                        local_ref = param.local_ref_gpu
+                        # local_ref = param.local_ref_gpu
                         local_error = param.local_error_gpu
+                    local_ref = param.local_ref
                     data_parallel_world_size = mpu.get_data_parallel_world_size()
                     ## wait io stream
                     torch.cuda.current_stream().wait_stream(self._param_stream[param])
@@ -476,20 +485,48 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     local_var = param.grad
                     local_main_grad = param.main_grad
                     local_var.add_(local_error)
-                    compressed_tensor = local_var.mul_(self.lowbit_scale/data_parallel_world_size).to(torch.int8)
-                    param.lowbit_grad.copy_(compressed_tensor)
+                    max_value = torch.max(local_var)
+                    
+                    
+                    # error_norm_before = torch.norm(local_var)
+                    compressed_tensor = local_var.mul_(self.lowbit_scale/data_parallel_world_size)
+                    if torch.max(compressed_tensor) > 127 or torch.min(compressed_tensor) < -127:
+                        self.compressed_overflow.fill_(1.0)
+                    # compressed_max_value = torch.max(compressed_tensor)
+                    # if torch.distributed.get_rank() == 0:
+                    #     print("local_var Max Value is {};compressed_max_value Max Value is {};current scale is {};"
+                    #           .format(max_value, compressed_max_value,self.lowbit_scale),
+                    #           flush=True)
+                    param.lowbit_grad.copy_(compressed_tensor.to(torch.int8))
 
                     # update error
                     local_var.copy_(compressed_tensor).div_(-self.lowbit_scale/data_parallel_world_size)
+                    # error_norm_after = torch.norm(local_var)
+                    
+                    # x, y = self._error_norm[dtype]
+                    # self._error_norm[dtype] = (
+                    #     x + error_norm_before**2, y
+                    # )
+                    # local_var.mul_(error_norm_before/error_norm_after)
                     local_var.add_(local_main_grad)
                     local_error.add_(local_var, alpha=1.-self.error_beta)
 
                     
                     # update ref
-                    local_ref.add_(local_main_grad, alpha=1.-self.error_beta) 
+                    # local_ref.add_(local_main_grad, alpha=1.-self.error_beta)
+                    local_main_grad.add_(local_ref, alpha=self.ref_lr)
+                    # x, y = self._error_norm[dtype]
+                    # self._error_norm[dtype] = (
+                    #     x + torch.norm(local_main_grad)**2, y
+                    # )
+                    local_ref.mul_(1.-self.error_beta).add_(local_main_grad, alpha=self.error_beta)
                     # local_ref.div_(1+self.ref_lr)
                     local_main_grad.copy_(local_ref)
-                    # local_ref.add_(local_main_grad, alpha=self.ref_lr) 
+                    # local_ref.add_(local_main_grad, alpha=self.ref_lr)
+                    # # torch.distributed.all_reduce(local_ref,
+                    # #                              group=mpu.get_tensor_model_parallel_group(),
+                    # #                              async_op=True)
+                    # # local_ref.div_(data_parallel_world_size)
                     # torch.abs(local_ref, out=local_var)
                     # sign_var = local_ref.sign()
                     # local_var.mul_(4).add_(self.ref_lr**2).sqrt_().add_(self.ref_lr).square_()
@@ -501,7 +538,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     if getattr(param, 'local_error', None) is not None:
                         timers('prefetch-load-GPU2CPU', log_level=2).start() 
                         with torch.cuda.stream(self._param_stream[param]):#(self._cpu_to_gpu_stream):
-                            param.local_ref.copy_(local_ref, non_blocking=True)
+                            # param.local_ref.copy_(local_ref, non_blocking=True)
                             param.local_error.copy_(local_error, non_blocking=True)
                         timers('prefetch-load-GPU2CPU').stop()
                         
@@ -509,9 +546,9 @@ class DistributedDataParallel(DistributedDataParallelBase):
                         dtype = torch.float if \
                                         self.accumulate_allreduce_grads_in_fp32 else param.dtype
                         self._err_prefetch[dtype].free(param.err_idx, param.data.nelement())
-                        self._ref_prefetch[dtype].free(param.ref_idx, param.data.nelement())
+                        # self._ref_prefetch[dtype].free(param.ref_idx, param.data.nelement())
                         self.prefetch_param_hook_gpu_tensor(param, skip_first=True)
-                    param.local_ref_gpu = None
+                    # param.local_ref_gpu = None
                     param.local_error_gpu = None
                     
                     

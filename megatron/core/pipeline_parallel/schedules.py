@@ -367,8 +367,10 @@ def forward_backward_no_pipelining(*,
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
 
-    if hasattr(model, '_before_opt_step') and not forward_only and not model.param_order.first_pass and model.grad_compression:
+    if hasattr(model, '_before_opt_step') and not forward_only and \
+          not model.param_order.first_pass and model.grad_compression:
          # timers('prefetch-load', log_level=2).start()
+         model.reset_reverse_param_iter()
          model.prefetch_param_hook_gpu_tensor(model.param_order.first_param)
          # timers('prefetch-load').stop()
 
@@ -399,7 +401,7 @@ def forward_backward_no_pipelining(*,
     
         if hasattr(model, '_before_opt_step') and model.grad_compression:
             model._before_opt_step = False
-            model.reset_reverse_param_iter()
+            # model.reset_reverse_param_iter()
             # torch.cuda.current_stream().wait_stream(model.prefetch_stream)
 
     return forward_data_store
