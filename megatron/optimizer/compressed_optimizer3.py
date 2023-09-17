@@ -72,7 +72,7 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
         self.pre_loss_scale = self.grad_scaler.scale
         self.low_bit_overflow = torch.cuda.FloatTensor([0.0])
         self.low_bit_step_gap = 0.0
-        self.lowbit_gap = 1024
+        self.lowbit_gap = 128
     
         
     def get_lowbit_buffer_dp_views(self):
@@ -88,35 +88,38 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
         # Buffer views.
         view_items = []
         for model_index, model in enumerate(self.models):
+            
             for dtype, mem_buffer in model._grad_buffers.items():
                 buf = mem_buffer.data
                 assert buf.numel() % data_parallel_world_size == 0
                 lowbit_grad_buf = model._lowbit_grad_buffers.get(dtype)
-                # ref_buf = model._local_ref_points.get(dtype)
+                ref_buf = model._local_error_feedbacks.get(dtype)#_local_ref_points.get(dtype)
                 
                 shard_size = int(buf.numel() / data_parallel_world_size)
                 buf_views = [buf[(r*shard_size):((r+1)*shard_size)]
                              for r in range(data_parallel_world_size)]
                 
-                if lowbit_grad_buf is not None:
+                if lowbit_grad_buf is not None and model._init_grad_flag:
                     # torch.cuda.current_stream().wait_stream(model._hook_stream)
-                    # ref_buf = ref_buf.data
+                    ref_buf = ref_buf.data
                     lowbit_grad_buf = lowbit_grad_buf.data
-                    # ref_buf_views = [ref_buf[(r*shard_size):((r+1)*shard_size)]
-                    #          for r in range(data_parallel_world_size)]
+                    ref_buf_views = [ref_buf[(r*shard_size):((r+1)*shard_size)]
+                             for r in range(data_parallel_world_size)]
                     lowbit_grad_buf_views = [lowbit_grad_buf[(r*shard_size):((r+1)*shard_size)]
                              for r in range(data_parallel_world_size)]
                     view_items.append((model_index, dtype, 
                                        buf, buf_views,
-                                    #    ref_buf,ref_buf_views,
+                                       ref_buf,ref_buf_views,
                                        lowbit_grad_buf,lowbit_grad_buf_views,
-                                       model.lowbit_scale, model._error_norm[dtype]))
+                                       model.lowbit_scale.item(), model.compressed_overflow))
                 else:
                     view_items.append((model_index, dtype, 
                                     buf, buf_views,
-                                    # None, None,
+                                    None, None,
                                     None, None,
                                     None, None))
+            if not model._init_grad_flag and self.low_bit_step_gap>50:
+                model._init_grad_flag = True
         return view_items
 
 
@@ -156,9 +159,9 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
         gbuf_view_items = self.get_lowbit_buffer_dp_views()
         for index, (model_index, dtype,
                     gbuf, gbuf_views,
-                    # ref_buf, ref_buf_views,
+                    ref_buf, ref_buf_views,
                     lowbit_grad_buf, lowbit_grad_buf_views,
-                    lowbit_scale, _error_norm) \
+                    lowbit_scale, compressed_overflow) \
             in enumerate(gbuf_view_items):
             if lowbit_grad_buf is None:
                 torch.distributed.reduce_scatter_tensor(
@@ -168,6 +171,18 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
                 )
                 continue
 
+            # torch.distributed.all_reduce(
+            #         ref_buf.div_(data_parallel_world_size),
+            #         group = data_parallel_group,
+            # )
+            self.low_bit_overflow += compressed_overflow
+            # gbuf_views[data_parallel_rank].add_(ref_buf_views[data_parallel_rank], alpha=1.0/lowbit_scale)
+            # torch.distributed.all_reduce(self.low_bit_overflow,
+            #                          op=torch.distributed.ReduceOp.MAX,
+            #                          group=self.get_model_parallel_group()
+            #                         )
+            # if (self.low_bit_overflow.item() > 0): 
+            #     continue
             # local_ref = gbuf_views[data_parallel_rank].clone()
             shard_size = int(gbuf.numel() / data_parallel_world_size)
             # compressed_tensor_views = lowbit_grad_buf_views[data_parallel_rank]
@@ -181,34 +196,44 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
                 lowbit_grad_buf_views,
                 # output_split_sizes=[shard_size]*data_parallel_world_size,
                 # input_split_sizes=[shard_size]*data_parallel_world_size,
-                group = data_parallel_group,
-                async_op=True
+                group = data_parallel_group
             )
-            gbuf_views[data_parallel_rank-1].zero_()
-            reduce(lambda x, y: x.add_(y), 
+            # gbuf_views[data_parallel_rank-1].zero_()
+            reduce(lambda x, y: x.add_(y, alpha = 1.0/(lowbit_scale*data_parallel_world_size)), 
                    local_lowbit_buf_views,
-                   gbuf_views[data_parallel_rank-1]
-            )
-            # gbuf.copy_(lowbit_grad_buf_gather)
-            # sum_low_bit = torch.sum(torch.stack(gbuf_views), dim=0)
-            max_value = torch.max(gbuf_views[data_parallel_rank-1])
-            min_value = torch.min(gbuf_views[data_parallel_rank-1])
-            
-            if max_value > 128.0 \
-                or min_value<-128.0:
-                        # print(sum_low_bit, flush=True)
-                    print("Rank{}: Max Value is {}; Min Value is {};".format(torch.distributed.get_rank(), max_value, min_value), flush=True)
-                    self.low_bit_overflow.fill_(1.0)
-                    return
-            # else: low_bit_overflow = torch.cuda.FloatTensor([0.0])
-            # torch.distributed.all_reduce(low_bit_overflow,
-            #                          op=torch.distributed.ReduceOp.MAX,
+                   gbuf_views[data_parallel_rank]
+            ) 
+            # ref_buf_views[data_parallel_rank].mul_(0.98).add_(gbuf_views[data_parallel_rank], alpha = 0.02)
+            # gbuf_views[data_parallel_rank-1].div_(lowbit_scale)
+            # pec = gbuf_views[data_parallel_rank].norm(2.0)*0.1*lowbit_scale
+            # rescale = torch.clamp(pec / (gbuf_views[data_parallel_rank-1].norm(2.0) + 1e-8),
+            #                       max=1.0)
+            # torch.distributed.all_reduce(rescale,
+            #                          op=torch.distributed.ReduceOp.MIN,
             #                          group=data_parallel_group
             #                         )
-            # self.low_bit_overflow += low_bit_overflow
-            if (self.low_bit_overflow.item() == 0):
-                gbuf_views[data_parallel_rank].\
-                    add_(gbuf_views[data_parallel_rank-1].div_(lowbit_scale))
+            # gbuf_views[data_parallel_rank].\
+            #         add_(gbuf_views[data_parallel_rank-1].mul_(rescale/lowbit_scale))
+            # # gbuf.copy_(lowbit_grad_buf_gather)
+            # # sum_low_bit = torch.sum(torch.stack(gbuf_views), dim=0)
+            # max_value = torch.max(gbuf_views[data_parallel_rank-1])
+            # min_value = torch.min(gbuf_views[data_parallel_rank-1])
+            
+            # if max_value > 128.0 \
+            #     or min_value<-128.0:
+            #             # print(sum_low_bit, flush=True)
+            #         print("Rank{}: Max Value is {}; Min Value is {};".format(torch.distributed.get_rank(), max_value, min_value), flush=True)
+            #         self.low_bit_overflow.fill_(1.0)
+            #         return
+            # # else: low_bit_overflow = torch.cuda.FloatTensor([0.0])
+            # # torch.distributed.all_reduce(low_bit_overflow,
+            # #                          op=torch.distributed.ReduceOp.MAX,
+            # #                          group=data_parallel_group
+            # #                         )
+            # # self.low_bit_overflow += low_bit_overflow
+            # if (self.low_bit_overflow.item() == 0):
+            #     gbuf_views[data_parallel_rank].\
+            #         add_(gbuf_views[data_parallel_rank-1].div_(lowbit_scale))
         timers('grads-reduce-scatter').stop()
         
        
@@ -218,33 +243,69 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
 
     @torch.no_grad()
     def step(self, args, timers):
-        # Update across all data parallel instances.
+        data_parallel_world_size = mpu.get_data_parallel_world_size()
+        data_parallel_group = mpu.get_data_parallel_group()
         torch.distributed.all_reduce(self.low_bit_overflow,
                                      op=torch.distributed.ReduceOp.MAX,
                                      group=self.get_model_parallel_group()
                                     )
+        # Update across all data parallel instances.
         if  (self.low_bit_overflow.item() > 0):
             # self._copy_model_grads_to_main_grads()
             self.low_bit_overflow.fill_(0.0)
+            self.low_bit_step_gap = 0.0
+            low_bit_all = torch.empty([torch.distributed.get_world_size(), 1], dtype=torch.float32).cuda()
+            
             for model_index, model in enumerate(self.models):
+                scale = max(model.lowbit_scale*0.5, 1.0) / model.lowbit_scale
                 model.lowbit_scale = max(model.lowbit_scale*0.5, 1.0)
-                for dtype, mem_buffer in model._local_error_feedbacks.items():
-                    mem_buffer.zero()
-                    ref_buf = model._local_ref_points.get(dtype)
-                    ref_buf.zero()
-                    if torch.distributed.get_rank() == 0:
-                        print("Rezero ref_buf", flush=True)
-                        print("Decay lowbit_scale to {} at step {};".format(model.lowbit_scale, self.low_bit_step_gap), flush=True)
+                model.compressed_overflow.fill_(0.0)
+                torch.distributed.all_gather_into_tensor(low_bit_all,
+                                                     model.lowbit_scale)
+                # model.ref_beta = min(model.ref_beta+1.0/(45_000),0.99)
+                # for dtype, mem_buffer in model._local_error_feedbacks.items():
+                #     # mem_buffer.zero()
+                #     mem_buffer.data.mul_(scale)
+                #     # ref_buf = model._local_ref_points.get(dtype)
+                #     # # ref_buf.data.mul_(scale)
+                #     # torch.distributed.all_reduce(ref_buf.data,
+                #     #                  group=data_parallel_group)
+                #     # ref_buf.data.div_(data_parallel_world_size)
+                #     # # ref_buf.zero()
+                #     # pre_buf = model._pre_grad_buffers.get(dtype)
+                #     # torch.distributed.all_reduce(pre_buf.data,
+                #     #                  group=data_parallel_group)
+                #     # pre_buf.data.div_(data_parallel_world_size)
+                if torch.distributed.get_rank() == 0:
+                    # print("Rescale err_buf", flush=True)
+                    print("Decay lowbit_scale to {} ;".format(low_bit_all), flush=True)
+            # self._copy_model_grads_to_main_grads()
             return False, None, None
         else:
             # print("Rank{}: Pass the low_bit_overflow at step {};".format(torch.distributed.get_rank(), self.low_bit_step_gap), flush=True)
             self.low_bit_step_gap+=1.0
             if self.low_bit_step_gap > self.lowbit_gap:
                 self.low_bit_step_gap = 0.0
+                low_bit_all = torch.empty([torch.distributed.get_world_size(), 1], dtype=torch.float32).cuda()
                 for model_index, model in enumerate(self.models):
                     model.lowbit_scale *= 2.0
+                    torch.distributed.all_gather_into_tensor(low_bit_all,
+                                                     model.lowbit_scale)
+                    # model.ref_beta = min(model.ref_beta+1.0/(45_000),0.999)
+                    # for dtype, mem_buffer in model._local_error_feedbacks.items():
+                    #     mem_buffer.data.mul_(2.0)
+                    #     # ref_buf = model._local_ref_points.get(dtype)
+                    #     # # ref_buf.zero()
+                    #     # # ref_buf.data.mul_(2.0)
+                    #     # torch.distributed.all_reduce(ref_buf.data,
+                    #     #                 group=data_parallel_group)
+                    #     # ref_buf.data.div_(data_parallel_world_size)
+                    #     # pre_buf = model._pre_grad_buffers.get(dtype)
+                    #     # torch.distributed.all_reduce(pre_buf.data,
+                    #     #                 group=data_parallel_group)
+                    #     # pre_buf.data.div_(data_parallel_world_size)
                     if torch.distributed.get_rank() == 0:
-                        print("Enlarge lowbit_scale to {};".format(model.lowbit_scale), flush=True)
+                        print("Enlarge lowbit_scale to {};".format(low_bit_all), flush=True)
         update_flag, grad_norm, num_zeros_in_grad = super().step(args, timers)
         if self.pre_loss_scale != self.grad_scaler.scale:
             scale_change = self.grad_scaler.scale/self.pre_loss_scale
@@ -262,4 +323,4 @@ class CompressedDistributedOptimizer(DistributedOptimizer):
                     if torch.distributed.get_rank() == 0:
                         print("Rezero ref_buf", flush=True)
         self.pre_loss_scale = self.grad_scaler.scale
-        return update_flag, grad_norm, num_zeros_in_grad
+        return update_flag, grad_norm, num_zeros_in_grad 

@@ -374,8 +374,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Verify that contiguous buffers are being used.
         # - Note: this should already be checked in arguments.py.
         assert use_contiguous_buffers_in_local_ddp
-        assert isinstance(optimizer, Adam), \
-            "Only Adam currently supported, due to checkpointing requirements."
+        # assert isinstance(optimizer, Adam), \
+        #     "Only Adam currently supported, due to checkpointing requirements."
 
         # Model grad buffer ranges.
         self.model_gbuf_ranges = []
@@ -890,6 +890,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         data_parallel_rank = mpu.get_data_parallel_rank()
         data_parallel_group = mpu.get_data_parallel_group()
+        data_parallel_world_size = mpu.get_data_parallel_world_size()
 
         # All-gather updated main params.
         # - All param buffer views are guaranteed to have the same num elements
@@ -906,6 +907,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 pbuf_views[data_parallel_rank],
                 group = data_parallel_group,
             )
+            # torch.distributed.all_reduce(
+            #         pbuf.div_(data_parallel_world_size),
+            #         group = data_parallel_group,
+            # )
 
         # Copy from param buffer to each param.
         for model_id, model in enumerate(self.models):

@@ -371,7 +371,7 @@ def forward_backward_no_pipelining(*,
           not model.param_order.first_pass and model.grad_compression:
          # timers('prefetch-load', log_level=2).start()
          model.reset_reverse_param_iter()
-         model.prefetch_param_hook_gpu_tensor(model.param_order.first_param)
+        #  model.prefetch_param_hook_gpu_tensor(model.param_order.first_param)
          # timers('prefetch-load').stop()
 
     with no_sync_func():
@@ -383,8 +383,8 @@ def forward_backward_no_pipelining(*,
                 backward_step(grad_scaler, input_tensor, output_tensor,
                               output_tensor_grad, model_type, timers, deallocate_pipeline_outputs)
 
-                if hasattr(model, 'param_order') and model.param_order.first_pass: 
-                    model.param_order.finish_first_pass()
+                # if hasattr(model, 'param_order') and model.param_order.first_pass: 
+                #     model.param_order.finish_first_pass()
                   
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
@@ -403,6 +403,9 @@ def forward_backward_no_pipelining(*,
             model._before_opt_step = False
             # model.reset_reverse_param_iter()
             # torch.cuda.current_stream().wait_stream(model.prefetch_stream)
+        
+        if hasattr(model, 'param_order') and model.param_order.first_pass: 
+                    model.param_order.finish_first_pass()
 
     return forward_data_store
 
