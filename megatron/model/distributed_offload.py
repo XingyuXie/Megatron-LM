@@ -22,7 +22,7 @@ from functools import partial
 
 import heapq
 
-class ParamScheduler:
+class ParamScheduler_old:
     def __init__(self):
         self.params = []
         self.timestamp = 0
@@ -70,7 +70,7 @@ class ParamScheduler:
 
 
 
-class ParamScheduler_old:
+class ParamScheduler:
     def __init__(self):
         self.param_order = {}
         self.last_param = None
@@ -336,17 +336,12 @@ class DistributedDataParallel(DistributedDataParallelBase):
                                                         torch.int8)
                     self._local_error_feedbacks[dtype] = MemoryBuffer(num_elements,
                                                             num_elements_padded,
-                                                            param.dtype)#, device=torch.device("cpu"))
+                                                            param.dtype, device=torch.device("cpu"))
                     self._local_ref_points[dtype] = MemoryBuffer(num_elements,
                                                             num_elements_padded,
-                                                            param.dtype)#, #device=torch.device("cpu"))
-                    
-                    # self._pre_grad_buffers[dtype] = MemoryBuffer(num_elements,
-                    #                                         num_elements_padded,
-                    #                                         param.dtype)#, #device=torch.device("cpu"))
-
+                                                            param.dtype, device=torch.device("cpu"))
                     ## prefetch 
-                    # num_elements = int(num_elements*0.2)
+                    # num_elements = int(num_elements*0.1)
                     # self._err_prefetch[dtype] = MemoryManager(num_elements,
                     #                                         param.dtype)
                     # self._ref_prefetch[dtype] = MemoryManager(num_elements,
@@ -366,17 +361,21 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     # dtype not in (torch.int8, torch.int16, torch.int32, torch.int64): 
                     #     if torch.distributed.get_rank() == 0:
                     #         print("name is {}; Size is {};".format(param_name,param.data.nelement()), flush=True)
-                        # if 'word_embeddings.weigh' in param_name:
-                        #     param.local_error_gpu_test = torch.zeros_like(param, dtype=param.dtype)
-                        #     param.local_ref_gpu_test = torch.zeros_like(param, dtype=param.dtype)
-                        #     self.skip_param.add(param)
-                        # else:
-                        param.local_error = \
-                            self._local_error_feedbacks[dtype].get(
-                            param.data.shape, type_num_elements[dtype])
-                        param.local_ref = \
-                            self._local_ref_points[dtype].get(
-                            param.data.shape, type_num_elements[dtype])
+                        if False:#'word_embeddings.weigh' in param_name:
+                            param.local_error_gpu_test = torch.zeros_like(param, dtype=param.dtype)
+                            param.local_ref_gpu_test = torch.zeros_like(param, dtype=param.dtype)
+                            self.skip_param.add(param)
+                        else:
+                            # param.local_error = \
+                            #     torch.zeros_like(param, dtype=param.dtype, device=torch.device("cpu"))
+                            # param.local_ref = \
+                            #     torch.zeros_like(param, dtype=param.dtype, device=torch.device("cpu"))
+                            param.local_error = \
+                                self._local_error_feedbacks[dtype].get(
+                                param.data.shape, type_num_elements[dtype])
+                            param.local_ref = \
+                                self._local_ref_points[dtype].get(
+                                param.data.shape, type_num_elements[dtype])
                         # param.pre_grad = \
                         #     self._pre_grad_buffers[dtype].get(
                         #     param.data.shape, type_num_elements[dtype])
@@ -385,6 +384,8 @@ class DistributedDataParallel(DistributedDataParallelBase):
                             param.data.shape, type_num_elements[dtype])
                         self._param_stream[param] = \
                             torch.cuda.Stream(device=torch.cuda.current_device())
+                        # self._G2C_stream[param] = \
+                        #     torch.cuda.Stream(device=torch.cuda.current_device())
 
                     param.main_grad = self._grad_buffers[dtype].get(
                         param.data.shape, type_num_elements[dtype])   
@@ -413,6 +414,8 @@ class DistributedDataParallel(DistributedDataParallelBase):
             ## prefetch part
             self.reset_reverse_param_iter()
             self.param_order = ParamScheduler()
+            # self._cpu_to_gpu_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+            self._gpu_to_cpu_stream = torch.cuda.Stream(device=torch.cuda.current_device())
             
             
 
@@ -423,43 +426,82 @@ class DistributedDataParallel(DistributedDataParallelBase):
         #     self._error_norm[dtype] = (0.0, 0.0)
 
 
-        for dtype, mem in self._err_prefetch.items():
-            mem.reset()
-            self._ref_prefetch[dtype].reset()
+        # for dtype, mem in self._err_prefetch.items():
+        #     mem.reset()
+        #     self._ref_prefetch[dtype].reset()
             # self._error_norm[dtype] = (0.0, 0.0)
 
 
+    # def param_hook_gpu_tensor(self, param):
+    #     if getattr(param, 'local_error_gpu', None) is None and param not in self.skip_param:
+    #         timers = get_timers()
+    #         # stream = torch.cuda.Stream()
+    #         # with self.stream_context():
+    #         dtype = torch.float if \
+    #             self.accumulate_allreduce_grads_in_fp32 else param.dtype
+    #         flag, err_tensor, err_idx = self._err_prefetch[dtype].allocate(param.data.shape)
+    #         # assert flag
+    #         if not flag: return False
+    #         _, ref_tensor, ref_idx = self._ref_prefetch[dtype].allocate(param.data.shape)
+            
+    #         timers('prefetch-load-CPU2GPU-prefetch', log_level=2).start()
+    #         # torch.cuda.current_stream().wait_stream(self._param_stream[param])
+    #         # torch.cuda.current_stream().wait_stream(self._gpu_to_cpu_stream)
+    #         with torch.cuda.stream(self._cpu_to_gpu_stream):
+    #             err_tensor.copy_(param.local_error, non_blocking=True)
+    #             ref_tensor.copy_(param.local_ref, non_blocking=True)
+    #         # param.local_ref_gpu = param.local_ref.cuda(non_blocking=True)
+    #         # param.local_error_gpu = param.local_error.cuda(non_blocking=True)
+    #         timers('prefetch-load-CPU2GPU-prefetch').stop()
+    #         param.local_ref_gpu = ref_tensor
+    #         param.local_error_gpu = err_tensor
+    #         param.err_idx = err_idx
+    #         param.ref_idx = ref_idx
+    #     return True
+        
     def param_hook_gpu_tensor(self, param):
         if getattr(param, 'local_error_gpu', None) is None and param not in self.skip_param:
             timers = get_timers()
             # stream = torch.cuda.Stream()
             # with self.stream_context():
-            dtype = torch.float if \
-                self.accumulate_allreduce_grads_in_fp32 else param.dtype
-            flag, err_tensor, err_idx = self._err_prefetch[dtype].allocate(param.data.shape)
-            # assert flag
-            if not flag: return False
+            # dtype = torch.float if \
+            #     self.accumulate_allreduce_grads_in_fp32 else param.dtype
+            # flag, err_tensor, err_idx = self._err_prefetch[dtype].allocate(param.data.shape)
+            # # assert flag
+            # if not flag: return False
             # _, ref_tensor, ref_idx = self._ref_prefetch[dtype].allocate(param.data.shape)
             
             timers('prefetch-load-CPU2GPU-prefetch', log_level=2).start()
-            with torch.cuda.stream(self._param_stream[param]):#(self._cpu_to_gpu_stream):
-                err_tensor.copy_(param.local_error, non_blocking=True)
+            # torch.cuda.current_stream().wait_stream(self._param_stream[param])
+            # torch.cuda.current_stream().wait_stream(self._gpu_to_cpu_stream)
+            # err_tensor = torch.zeros_like(param, dtype=param.dtype)
+            # ref_tensor = torch.zeros_like(param, dtype=param.dtype)
+            with torch.cuda.stream(self._param_stream[param]):
+                err_tensor = param.local_error.cuda(non_blocking=True)
+                ref_tensor = param.local_ref.cuda(non_blocking=True)
+                
+                # err_tensor.copy_(param.local_error, non_blocking=True)
                 # ref_tensor.copy_(param.local_ref, non_blocking=True)
             # param.local_ref_gpu = param.local_ref.cuda(non_blocking=True)
             # param.local_error_gpu = param.local_error.cuda(non_blocking=True)
             timers('prefetch-load-CPU2GPU-prefetch').stop()
-            # param.local_ref_gpu = ref_tensor
+            # err_tensor.record_stream(torch.cuda.current_stream())
+            # ref_tensor.record_stream(torch.cuda.current_stream())
+            param.local_ref_gpu = ref_tensor
             param.local_error_gpu = err_tensor
-            param.err_idx = err_idx
+            
+            # param.err_idx = err_idx
             # param.ref_idx = ref_idx
         return True
-        
+
     def prefetch_param_hook_gpu_tensor(self, param, skip_first = False):
         if param is None: return
+        if not skip_first: torch.cuda.current_stream().wait_stream(self._gpu_to_cpu_stream)
         if not skip_first and not self.param_hook_gpu_tensor(param): return
-        param_loads = self.param_order.get_next_params(param)
+        param_loads = self.param_order.get_next_params(param, 2)
         for param_load in param_loads:
             if not self.param_hook_gpu_tensor(param_load): return
+    
 
     @torch.no_grad()
     def _make_param_hook(self, param):
@@ -472,47 +514,67 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 param.main_grad.add_(param.grad.data)
 
                 if param not in self.skip_param: self.param_order.add_param(param)
-                if self._before_opt_step and hasattr(param, 'local_error') \
-                    and not self.param_order.first_pass:
-                    
-                    # and self._init_grad_flag:
-                    # timers = get_timers()
-                    # dtype = torch.float if \
-                    #     self.accumulate_allreduce_grads_in_fp32 else param.dtype
-                    # x, y = self._error_norm[dtype]
-                    # self._error_norm[dtype] = (
-                    #     x + torch.norm(param.main_grad)**2, y
-                    # )
-                    # if getattr(param, 'local_error_gpu_test', None) is not None:
-                    #     # local_ref = param.local_ref_gpu_test
-                    #     local_error = param.local_error_gpu_test
-                    #     # if torch.distributed.get_rank() == 0:
-                    #     #     print("In GPU;", flush=True)
-                    # elif getattr(param, 'local_error_gpu', None) is None:
-                    #     timers('prefetch-load-CPU2GPU-prefetch', log_level=2).start()
-                    #     with torch.cuda.stream(self._param_stream[param]):#(self._cpu_to_gpu_stream):
-                    #         # local_ref = torch.empty_like(param.main_grad, dtype=param.dtype)
-                    #         local_error = torch.empty_like(param.main_grad, dtype=param.dtype)
-                    #         # local_ref.copy_(param.local_ref, non_blocking=True)
-                    #         local_error.copy_(param.local_error, non_blocking=True)
-                    #     timers('prefetch-load-CPU2GPU-prefetch').stop()
+                if self._before_opt_step and self.grad_compression and not self.param_order.first_pass:
+                    timers = get_timers()
+                    if getattr(param, 'local_error_gpu_test', None) is not None:
+                        local_ref = param.local_ref_gpu_test
+                        local_error = param.local_error_gpu_test
+                        # if torch.distributed.get_rank() == 0:
+                        #     print("In GPU;", flush=True)
+                    elif getattr(param, 'local_error_gpu', None) is None:
+                        timers('prefetch-load-CPU2GPU-prefetch', log_level=2).start()
+                        with torch.cuda.stream(self._param_stream[param]):#(self._cpu_to_gpu_stream):
+                            # local_ref = torch.zeros_like(param, dtype=param.dtype)
+                            # local_error = torch.zeros_like(param, dtype=param.dtype)
+                            # local_ref.copy_(param.local_ref, non_blocking=True)
+                            # local_error.copy_(param.local_error, non_blocking=True)
+                            local_error = param.local_error.cuda(non_blocking=True)
+                            local_ref = param.local_ref.cuda(non_blocking=True)
+                        timers('prefetch-load-CPU2GPU-prefetch').stop()
+                        
+                    else: 
 
-                    # else:                       
-                    #     # local_ref = param.local_ref_gpu
-                    #     local_error = param.local_error_gpu
-                    local_ref = param.local_ref
-                    local_error = param.local_error
-                    # pre_grad = param.pre_grad
-                    # data_parallel_world_size = mpu.get_data_parallel_world_size()
-                    ## wait io stream
-                    # torch.cuda.current_stream().wait_stream(self._param_stream[param])
-
+                        local_ref = param.local_ref_gpu
+                        local_error = param.local_error_gpu
+                    # local_ref = param.local_ref
+                    # local_error = param.local_error
+                    # wait io stream
+                    self._param_stream[param].synchronize()
+                    # torch.cuda.default_stream().wait_stream(self._param_stream[param])
+                    # local_error.record_stream(torch.cuda.current_stream())
+                    # local_ref.record_stream(torch.cuda.current_stream())
+                    # if getattr(param, 'local_error_gpu_test', None) is None:
+                    #     local_error.record_stream(torch.cuda.current_stream())
+                    #     local_ref.record_stream(torch.cuda.current_stream())
+                    # print("default_stream:", torch.cuda.default_stream(),
+                    #     "current_stream:", torch.cuda.current_stream(), flush=True)
                     
                     local_var = param.grad
                     local_main_grad = param.main_grad               
                     
+                    
                     if not self._init_grad_flag:
                         local_ref.zero_().add_(param.data, alpha = (1.-self.ref_beta))
+                        if getattr(param, 'local_error_gpu_test', None) is None:
+                            timers('prefetch-load-GPU2CPU', log_level=2).start() 
+                            
+                            # with torch.cuda.stream(self._gpu_to_cpu_stream):
+                            param.local_ref.copy_(local_ref, non_blocking=True)
+                            timers('prefetch-load-GPU2CPU').stop()
+                            # local_ref.record_stream(self._gpu_to_cpu_stream)
+                            # self._gpu_to_cpu_stream.synchronize()
+                            # torch.cuda.default_stream().wait_stream(self._gpu_to_cpu_stream)
+                        if getattr(param, 'err_idx', None) is not None:
+                            dtype = torch.float if \
+                                            self.accumulate_allreduce_grads_in_fp32 else param.dtype
+                            self._err_prefetch[dtype].free(param.err_idx, param.data.nelement())
+                            self._ref_prefetch[dtype].free(param.ref_idx, param.data.nelement())
+                            # self.prefetch_param_hook_gpu_tensor(param, skip_first=True)
+                            param.err_idx = None
+                        
+                        # local_ref.record_stream(torch.cuda.current_stream())
+                        param.local_ref_gpu = None
+                        param.local_error_gpu = None
                         param.grad = None
                         return
                     else:
@@ -534,8 +596,38 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     local_ref.mul_(self.ref_beta).add_(param.data, alpha = (1.-self.ref_beta))
 
                     torch.cuda.nvtx.range_pop()
+
+                    if getattr(param, 'local_error', None) is not None:
+                        timers('prefetch-load-GPU2CPU', log_level=2).start()
+                        with torch.cuda.stream(self._gpu_to_cpu_stream):
+                            param.local_ref.copy_(local_ref, non_blocking=False)
+                            param.local_error.copy_(local_error, non_blocking=False)
+                           
+                            # param.local_ref = local_ref.to("cpu", non_blocking=True)
+                            # param.local_error = local_error.to("cpu", non_blocking=True)
+                            local_ref.record_stream(self._gpu_to_cpu_stream)
+                            local_error.record_stream(self._gpu_to_cpu_stream)
+                        self._gpu_to_cpu_stream.synchronize()
+                        timers('prefetch-load-GPU2CPU').stop()
+                        
+                        # ev.synchronize()
+                        # torch.cuda.current_stream().synchronize()
+                        # self._gpu_to_cpu_stream.synchronize()
+                        # torch.cuda.default_stream().wait_stream(self._gpu_to_cpu_stream)
                     
-                    
+                    if getattr(param, 'err_idx', None) is not None:
+                        dtype = torch.float if \
+                                        self.accumulate_allreduce_grads_in_fp32 else param.dtype
+                        self._err_prefetch[dtype].free(param.err_idx, param.data.nelement())
+                        self._ref_prefetch[dtype].free(param.ref_idx, param.data.nelement())
+                        param.err_idx = None
+                    # local_ref.record_stream(self._gpu_to_cpu_stream)
+                    # local_error.record_stream(self._gpu_to_cpu_stream)
+                    # local_error.record_stream(torch.cuda.current_stream())
+                    # local_ref.record_stream(torch.cuda.current_stream())
+                    param.local_ref_gpu = None
+                    param.local_error_gpu = None
+                    self.prefetch_param_hook_gpu_tensor(param, skip_first=True)
                 # Now we can deallocate grad memory.
                 param.grad = None
         return param_hook

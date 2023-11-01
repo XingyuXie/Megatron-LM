@@ -263,14 +263,10 @@ class DistributedDataParallel(DistributedDataParallelBase):
         self.grad_compression=True#grad_compression
         self._before_opt_step = False
         if self.grad_compression:
-            self.lowbit_scale = 2048.0*48.0#torch.tensor([2048*2.0], dtype=torch.float32).cuda()
+            self.lowbit_scale = 2048.0*64.0#torch.tensor([2048*2.0], dtype=torch.float32).cuda()
             self.error_beta = 0.8
             self.ref_beta = 0.95
-            self.square_mul = 1.5
-            self.err_clip = 1.0
             self.ref_lr = 1.0
-
-
 
             self.compressed_overflow = torch.cuda.FloatTensor([0.0])
         # If we are using fp32-accumulate-allreduce explicitly
@@ -323,7 +319,8 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 # due to a constraint with the reduce_scatter op, which requires
                 # all tensors have equal size. See: optimizer.py.)
                 num_elements_padded = data_parallel_world_size * \
-                    int(2 * math.ceil(num_elements / (2 * data_parallel_world_size)))
+                    int(math.ceil(num_elements / data_parallel_world_size))
+
                 # Allocate grad buffer.
                 self._grad_buffers[dtype] = MemoryBuffer(num_elements,
                                                          num_elements_padded,
@@ -419,14 +416,10 @@ class DistributedDataParallel(DistributedDataParallelBase):
     ## prefetch part
     def reset_reverse_param_iter(self):
         if not self.grad_compression: return
-        # for dtype, mem in self._lowbit_grad_buffers.items():
-        #     self._error_norm[dtype] = (0.0, 0.0)
-
-
         for dtype, mem in self._err_prefetch.items():
             mem.reset()
             self._ref_prefetch[dtype].reset()
-            # self._error_norm[dtype] = (0.0, 0.0)
+            self._error_norm[dtype] = (1e-8, 1e-8)
 
 
     def param_hook_gpu_tensor(self, param):
@@ -455,7 +448,6 @@ class DistributedDataParallel(DistributedDataParallelBase):
         return True
         
     def prefetch_param_hook_gpu_tensor(self, param, skip_first = False):
-        if param is None: return
         if not skip_first and not self.param_hook_gpu_tensor(param): return
         param_loads = self.param_order.get_next_params(param)
         for param_load in param_loads:
@@ -470,19 +462,34 @@ class DistributedDataParallel(DistributedDataParallelBase):
             if param.grad is not None:
                 # The gradient function of linear layers is fused with GEMMs
                 param.main_grad.add_(param.grad.data)
+                # param.lowbit_grad.copy_(param.main_grad)
+                # try:
+                #     assert (param.lowbit_grad == param.main_grad).all()
+                # except AssertionError:
+                #     if torch.distributed.get_rank() == 0:
+                #         diff = param.lowbit_grad - param.main_grad
+                #         diff_idx = (diff.abs() > 1e-6)
+                #         count_diff = diff_idx.sum().item()  # 使用.item()来获取Python标量
+                #         ref_diff = param.lowbit_grad[diff_idx]
+                #         print("hook print: lowbit_grad size is {}, main_grad size is {}".format(
+                #             param.lowbit_grad.numel(),  # 使用.numel()来获取元素数量
+                #             param.main_grad.numel()), flush=True)
+                #         print("hook print: gbuf size is {}, diff count is {}".format(
+                #             param.lowbit_grad.numel(),
+                #             count_diff), flush=True)
+                #         print("hook print: stats: max is {}, mean is {}, min is {}".format(
+                #             ref_diff.max().item(),  # 使用.item()来获取Python标量
+                #             ref_diff.mean().item(),  # 使用.item()来获取Python标量
+                #             ref_diff.min().item()), flush=True)  # 使用.item()来获取Python标量
 
-                if param not in self.skip_param: self.param_order.add_param(param)
+                # if param not in self.skip_param: self.param_order.add_param(param)
                 if self._before_opt_step and hasattr(param, 'local_error') \
                     and not self.param_order.first_pass:
-                    
                     # and self._init_grad_flag:
                     # timers = get_timers()
                     # dtype = torch.float if \
                     #     self.accumulate_allreduce_grads_in_fp32 else param.dtype
-                    # x, y = self._error_norm[dtype]
-                    # self._error_norm[dtype] = (
-                    #     x + torch.norm(param.main_grad)**2, y
-                    # )
+                    
                     # if getattr(param, 'local_error_gpu_test', None) is not None:
                     #     # local_ref = param.local_ref_gpu_test
                     #     local_error = param.local_error_gpu_test
@@ -510,28 +517,79 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     
                     local_var = param.grad
                     local_main_grad = param.main_grad               
+                    # param.lowbit_grad.copy_(local_main_grad)
+                    # local_main_grad.add_(local_ref, alpha=-1.0)
+                    # local_var.copy_(local_main_grad)
+                    # grad_norm = local_main_grad.norm(2.0).div_(mpu.get_data_parallel_world_size())
+                    # torch.distributed.all_reduce(grad_norm,
+                    #                              group=mpu.get_tensor_model_parallel_group(),
+                    # )
+                    
+
                     
                     if not self._init_grad_flag:
-                        local_ref.zero_().add_(param.data, alpha = (1.-self.ref_beta))
+                        local_ref.zero_().add_(param.data, 
+                                        alpha = (1.-self.ref_beta))
+                        # local_ref.copy_(local_main_grad)
+                        # torch.distributed.all_reduce(local_ref,
+                        #                          group=mpu.get_tensor_model_parallel_group(),
+                        # )
+                        # local_main_grad.div_(mpu.get_data_parallel_world_size())
+                        # pre_grad.add_(local_main_grad, alpha = -(1.0-self.ref_beta))
                         param.grad = None
+                        # if torch.distributed.get_rank() == 0:
+                        #     print("_init_grad_flag;", flush=True)
                         return
                     else:
+                        # local_ref.mul_(self.ref_beta).add_(local_main_grad, alpha = (1.0-self.ref_beta))
+                        # pre_grad.add_(local_main_grad, alpha = (1.0-self.ref_beta))
+                        # inv_local_lr = (torch.sqrt(pre_grad).add_(1e-8)).div(self.ref_lr).mul_(param.data)
                         local_ref.add_(param.data, alpha = -(1.0-self.ref_beta))#.clamp_(min=-1.0, max=1.0)
-                        tmp_local_ref = local_ref.pow(3.0).mul_(self.square_mul)
-                
+                        # tmp_local_ref = local_ref
+                        #.mul_(2.0)
+                        # tmp_local_ref = local_ref.pow(3.0)#.mul_(2.0)
+                        sign_ref = local_ref.sign()
+                        tmp_local_ref = local_ref.square().mul_(sign_ref).mul_(1.5)
+                        # local_ref.div_(local_ref.norm(2.0)+1e-8).mul_(grad_norm)
+
+
                     torch.cuda.nvtx.range_push("Err-FeedBack&Ref-Point")
 
+                    # local_ref_new = local_ref+pre_grad
+                    # local_main_grad.mul_(2.0).add_(pre_grad, alpha = -1.0)
                     local_main_grad.add_(tmp_local_ref, alpha = -1.0).add_(local_error)#.clamp_(min=-1.0, max=1.0)
-                    local_var.copy_(local_main_grad)
-                    param.lowbit_grad.copy_(local_var.mul_(self.lowbit_scale)\
-                                            .clamp_(min=-8, max=7).to(torch.int8))
+                    #.add_(local_error, alpha=1.0/self.lowbit_scale)
+                    # local_main_grad.add_(local_ref, alpha = -1.0)
+                    # local_var.add_(local_error, alpha=1.0/self.lowbit_scale)
+
+                    # local_var.add_(local_ref_new, alpha=-1.0)
+                    # local_main_grad.mul_(self.lowbit_scale)
+                    # max_value = torch.max(local_main_grad)
+                    # min_value = torch.min(local_main_grad)
+                    # # if torch.distributed.get_rank() == 0:
+                    # #     print("Rank{}: Max Value is {}; Min Value is {};".format(torch.distributed.get_rank(),
+                    # #                                         max_value, min_value), flush=True)
+                    # if max_value > 8191*32 or min_value < -8192*32:
+                    #     self.compressed_overflow.fill_(1.0)
+                    # torch.clamp(local_main_grad, min=-128, max=127, out=pre_grad)
+                    param.lowbit_grad.copy_(local_main_grad.mul(self.lowbit_scale)\
+                                            .clamp_(min=-127, max=127).to(torch.int8))
                     #.to(torch.int8))
                 
+                
                     # update error
+                    # local_var.copy_(param.lowbit_grad).div_(self.lowbit_scale)
+                    # local_var.add_(local_main_grad, alpha=-1.0)#.div_(self.lowbit_scale/data_parallel_world_size)
+                    # local_error.copy_(local_var)
                     local_main_grad.add_(param.lowbit_grad, alpha=-1./self.lowbit_scale)
                     local_error.mul_(self.error_beta).add_(local_main_grad, alpha = (1.-self.error_beta))
+                    
                     local_main_grad.copy_(tmp_local_ref)
+                    # local_main_grad.zero_()
+                    # torch.sqrt(pre_grad, out=inv_local_lr)
+                    # inv_local_lr.add_(1e-8).div(self.ref_lr).mul_(param.data)
                     local_ref.mul_(self.ref_beta).add_(param.data, alpha = (1.-self.ref_beta))
+                                        # alpha = (1.0-self.ref_beta)*(1-0.1*self.ref_lr))
 
                     torch.cuda.nvtx.range_pop()
                     

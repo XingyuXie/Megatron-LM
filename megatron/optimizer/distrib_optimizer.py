@@ -907,10 +907,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 pbuf_views[data_parallel_rank],
                 group = data_parallel_group,
             )
-            # torch.distributed.all_reduce(
-            #         pbuf.div_(data_parallel_world_size),
-            #         group = data_parallel_group,
-            # )
 
         # Copy from param buffer to each param.
         for model_id, model in enumerate(self.models):
